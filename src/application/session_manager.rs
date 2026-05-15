@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use base64::{Engine as _, engine::general_purpose};
 use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
@@ -164,6 +165,80 @@ impl SessionManager {
         Ok(resolve_directory_from_output(&path, &output))
     }
 
+    pub async fn read_remote_file(&self, session_id: String, path: String) -> Result<String> {
+        let bytes = self.read_remote_file_bytes(session_id, path).await?;
+        Ok(String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    pub async fn read_remote_file_bytes(
+        &self,
+        session_id: String,
+        path: String,
+    ) -> Result<Vec<u8>> {
+        let output = self.exec(session_id, read_file_command(&path)).await?;
+        let normalized = output
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<String>();
+        Ok(general_purpose::STANDARD
+            .decode(normalized.as_bytes())
+            .unwrap_or_default())
+    }
+
+    pub async fn write_remote_file(
+        &self,
+        session_id: String,
+        path: String,
+        content: String,
+    ) -> Result<()> {
+        let data = content.into_bytes();
+        self.upload_remote_file(session_id, path, data).await
+    }
+
+    pub async fn upload_remote_file(
+        &self,
+        session_id: String,
+        path: String,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        self.exec(session_id, write_file_command(&path, &data))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn create_remote_directory(&self, session_id: String, path: String) -> Result<()> {
+        self.exec(session_id, create_directory_command(&path))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn create_remote_file(&self, session_id: String, path: String) -> Result<()> {
+        self.exec(session_id, write_file_command(&path, &[]))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn chmod_remote_path(
+        &self,
+        session_id: String,
+        path: String,
+        mode: String,
+    ) -> Result<()> {
+        let trimmed = mode.trim();
+        if trimmed.len() != 3 && trimmed.len() != 4 {
+            return Err(PortixError::InvalidProfile(
+                "chmod mode must be 3 or 4 octal digits".to_owned(),
+            ));
+        }
+        if !trimmed.chars().all(|char| matches!(char, '0'..='7')) {
+            return Err(PortixError::InvalidProfile(
+                "chmod mode must contain only octal digits".to_owned(),
+            ));
+        }
+        self.exec(session_id, chmod_command(&path, trimmed)).await?;
+        Ok(())
+    }
+
     async fn exec(&self, session_id: String, command: String) -> Result<String> {
         let session = self.session(&session_id).await?;
         let (response_tx, response_rx) = oneshot::channel();
@@ -199,13 +274,54 @@ impl SessionManager {
 }
 
 fn remote_system_command() -> String {
-    r#"printf 'OS=%s\n' "$(uname -srm 2>/dev/null)"
+    r#"if [ -r /etc/redhat-release ]; then
+  os="$(cat /etc/redhat-release 2>/dev/null)"
+else
+  os="$(uname -srm 2>/dev/null)"
+fi
+printf 'OS=%s\n' "$os"
 printf 'HOST=%s\n' "$(hostname 2>/dev/null)"
-printf 'UPTIME=%s\n' "$(uptime -p 2>/dev/null || uptime 2>/dev/null)"
-printf 'MEM=%s\n' "$(free -h 2>/dev/null | awk '/Mem:/ {print $3 " / " $2}' || printf '')"
-printf 'DISK=%s\n' "$(df -h / 2>/dev/null | awk 'NR==2 {print $4 " free / " $2}')"
-awk '/MemTotal:/ {total=$2*1024} /MemAvailable:/ {free=$2*1024} END {used=total-free; printf "MEM_USED_BYTES=%.0f\nMEM_FREE_BYTES=%.0f\nMEM_TOTAL_BYTES=%.0f\n", used, free, total}' /proc/meminfo 2>/dev/null
-df -B1 / 2>/dev/null | awk 'NR==2 {printf "DISK_USED_BYTES=%s\nDISK_FREE_BYTES=%s\nDISK_TOTAL_BYTES=%s\n", $3, $4, $2}'
+printf 'UPTIME=%s\n' "$(uptime 2>/dev/null)"
+awk '
+  /MemTotal:/ {total=$2 * 1024}
+  /MemFree:/ {mem_free=$2 * 1024}
+  /Buffers:/ {buffers=$2 * 1024}
+  /^Cached:/ {cached=$2 * 1024}
+  /MemAvailable:/ {available=$2 * 1024}
+  END {
+    if (available == 0) available = mem_free + buffers + cached
+    used = total - available
+    if (used < 0) used = 0
+    printf "MEM=%s / %s\n", human(used), human(total)
+    printf "MEM_USED_BYTES=%.0f\nMEM_FREE_BYTES=%.0f\nMEM_TOTAL_BYTES=%.0f\n", used, available, total
+  }
+  function human(bytes, value, unit) {
+    value = bytes
+    unit = "B"
+    if (value >= 1024) { value = value / 1024; unit = "KB" }
+    if (value >= 1024) { value = value / 1024; unit = "MB" }
+    if (value >= 1024) { value = value / 1024; unit = "GB" }
+    return sprintf("%.1f %s", value, unit)
+  }
+' /proc/meminfo 2>/dev/null
+df -P -k / 2>/dev/null | awk '
+  NR==2 {
+    total=$2 * 1024
+    used=$3 * 1024
+    free=$4 * 1024
+    printf "DISK=%s free / %s\n", human(free), human(total)
+    printf "DISK_USED_BYTES=%.0f\nDISK_FREE_BYTES=%.0f\nDISK_TOTAL_BYTES=%.0f\n", used, free, total
+  }
+  function human(bytes, value, unit) {
+    value = bytes
+    unit = "B"
+    if (value >= 1024) { value = value / 1024; unit = "KB" }
+    if (value >= 1024) { value = value / 1024; unit = "MB" }
+    if (value >= 1024) { value = value / 1024; unit = "GB" }
+    return sprintf("%.1f %s", value, unit)
+  }
+'
+true
 "#
     .to_owned()
 }
@@ -215,7 +331,7 @@ fn list_directory_command(path: &str) -> String {
     format!(
         r#"p={quoted}
 if [ -d "$p" ]; then
-  if find "$p" -mindepth 1 -maxdepth 1 -printf '%y\t%s\t%f\t%p\n' >/tmp/portix_ls_$$ 2>/dev/null; then
+  if find "$p" -mindepth 1 -maxdepth 1 -printf '%y\t%s\t%T@\t%f\t%p\n' >/tmp/portix_ls_$$ 2>/dev/null; then
     cat /tmp/portix_ls_$$
     rm -f /tmp/portix_ls_$$
   else
@@ -223,10 +339,12 @@ if [ -d "$p" ]; then
     for item in "$p"/.[!.]* "$p"/..?* "$p"/*; do
       [ -e "$item" ] || continue
       name=$(basename "$item")
+      modified=$(stat -c %Y "$item" 2>/dev/null || stat -f %m "$item" 2>/dev/null || printf 0)
       if [ -d "$item" ]; then
-        printf 'd\t0\t%s\t%s\n' "$name" "$item"
+        printf 'd\t0\t%s\t%s\t%s\n' "$modified" "$name" "$item"
       else
-        printf 'f\t0\t%s\t%s\n' "$name" "$item"
+        size=$(wc -c < "$item" 2>/dev/null || printf 0)
+        printf 'f\t%s\t%s\t%s\t%s\n' "$size" "$modified" "$name" "$item"
       fi
     done
   fi
@@ -250,6 +368,50 @@ else
 fi
 "#
     )
+}
+
+fn read_file_command(path: &str) -> String {
+    let quoted = shell_quote(path);
+    format!(
+        r#"p={quoted}
+if [ -f "$p" ] && [ -r "$p" ]; then
+  if command -v base64 >/dev/null 2>&1; then
+    base64 "$p"
+  else
+    openssl base64 -in "$p"
+  fi
+fi
+"#
+    )
+}
+
+fn write_file_command(path: &str, data: &[u8]) -> String {
+    let quoted = shell_quote(path);
+    let encoded = general_purpose::STANDARD.encode(data);
+    format!(
+        r#"p={quoted}
+mkdir -p "$(dirname "$p")"
+cat > "$p".portix.b64 <<'PORTIX_FILE'
+{encoded}
+PORTIX_FILE
+if command -v base64 >/dev/null 2>&1; then
+  base64 -d "$p".portix.b64 > "$p" 2>/dev/null || base64 --decode "$p".portix.b64 > "$p"
+else
+  openssl base64 -d -in "$p".portix.b64 -out "$p"
+fi
+rm -f "$p".portix.b64
+"#
+    )
+}
+
+fn create_directory_command(path: &str) -> String {
+    let quoted = shell_quote(path);
+    format!("mkdir -p {quoted}\n")
+}
+
+fn chmod_command(path: &str, mode: &str) -> String {
+    let quoted = shell_quote(path);
+    format!("chmod {mode} {quoted}\n")
 }
 
 fn shell_quote(value: &str) -> String {
@@ -290,9 +452,16 @@ fn parse_remote_directory(base_path: &str, output: &str) -> Vec<RemoteFileEntry>
     let mut entries = output
         .lines()
         .filter_map(|line| {
-            let mut parts = line.splitn(4, '\t');
+            let mut parts = line.splitn(5, '\t');
             let kind = parts.next()?;
             let size = parts.next()?.parse::<u64>().unwrap_or(0);
+            let modified_unix_seconds = parts
+                .next()?
+                .split('.')
+                .next()
+                .unwrap_or("0")
+                .parse::<i64>()
+                .unwrap_or(0);
             let name = parts.next()?.to_owned();
             let path = parts.next()?.to_owned();
             Some(RemoteFileEntry {
@@ -300,6 +469,7 @@ fn parse_remote_directory(base_path: &str, output: &str) -> Vec<RemoteFileEntry>
                 path,
                 is_directory: kind == "d" || kind == "dir",
                 size_bytes: size,
+                modified_unix_seconds,
             })
         })
         .collect::<Vec<_>>();

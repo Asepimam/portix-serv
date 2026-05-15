@@ -38,7 +38,6 @@ struct Client;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
-const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(120);
 const MIN_COLS: u32 = 20;
 const MIN_ROWS: u32 = 5;
 const MAX_COLS: u32 = 512;
@@ -128,7 +127,7 @@ impl SshRuntime {
 
     async fn connect_and_authenticate(&self) -> Result<client::Handle<Client>> {
         let config = Arc::new(client::Config {
-            inactivity_timeout: Some(INACTIVITY_TIMEOUT),
+            inactivity_timeout: None,
             ..Default::default()
         });
         let mut session = timeout(

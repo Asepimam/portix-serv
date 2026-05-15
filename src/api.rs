@@ -54,6 +54,56 @@ pub async fn resolve_remote_directory(session_id: String, path: String) -> anyho
         .await?)
 }
 
+pub async fn read_remote_file(session_id: String, path: String) -> anyhow::Result<String> {
+    Ok(SESSION_MANAGER.read_remote_file(session_id, path).await?)
+}
+
+pub async fn read_remote_file_bytes(session_id: String, path: String) -> anyhow::Result<Vec<u8>> {
+    Ok(SESSION_MANAGER
+        .read_remote_file_bytes(session_id, path)
+        .await?)
+}
+
+pub async fn write_remote_file(
+    session_id: String,
+    path: String,
+    content: String,
+) -> anyhow::Result<()> {
+    Ok(SESSION_MANAGER
+        .write_remote_file(session_id, path, content)
+        .await?)
+}
+
+pub async fn upload_remote_file(
+    session_id: String,
+    path: String,
+    data: Vec<u8>,
+) -> anyhow::Result<()> {
+    Ok(SESSION_MANAGER
+        .upload_remote_file(session_id, path, data)
+        .await?)
+}
+
+pub async fn create_remote_directory(session_id: String, path: String) -> anyhow::Result<()> {
+    Ok(SESSION_MANAGER
+        .create_remote_directory(session_id, path)
+        .await?)
+}
+
+pub async fn create_remote_file(session_id: String, path: String) -> anyhow::Result<()> {
+    Ok(SESSION_MANAGER.create_remote_file(session_id, path).await?)
+}
+
+pub async fn chmod_remote_path(
+    session_id: String,
+    path: String,
+    mode: String,
+) -> anyhow::Result<()> {
+    Ok(SESSION_MANAGER
+        .chmod_remote_path(session_id, path, mode)
+        .await?)
+}
+
 pub async fn terminal_output_stream(sink: StreamSink<String>) -> anyhow::Result<()> {
     let mut rx = SESSION_MANAGER.terminal_output_stream();
     tokio::spawn(async move {

@@ -36,4 +36,5 @@ pub struct RemoteFileEntry {
     pub path: String,
     pub is_directory: bool,
     pub size_bytes: u64,
+    pub modified_unix_seconds: i64,
 }
