@@ -3,8 +3,12 @@ use std::sync::Arc;
 
 use base64::{Engine as _, engine::general_purpose};
 use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
+use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
+use crate::domain::autocomplete::{
+    CompletionItem, CompletionKind, TerminalCompleteRequest, TerminalCompleteResponse,
+};
 use crate::domain::errors::{PortixError, Result};
 use crate::domain::events::{ConnectionStatusEvent, ErrorEvent, TerminalOutputEvent};
 use crate::domain::profile::SshProfile;
@@ -20,6 +24,9 @@ pub struct SessionManager {
     status_tx: broadcast::Sender<ConnectionStatusEvent>,
     error_tx: broadcast::Sender<ErrorEvent>,
 }
+
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
+const UPLOAD_BASE64_CHUNK_SIZE: usize = 12 * 1024;
 
 #[derive(Clone)]
 struct ManagedSession {
@@ -145,6 +152,88 @@ impl SessionManager {
         Ok(parse_remote_system_snapshot(&output))
     }
 
+    pub async fn command_help_suggestions(
+        &self,
+        session_id: String,
+        input: String,
+    ) -> Result<Vec<String>> {
+        let Some(request) = HelpSuggestionRequest::parse(&input) else {
+            return Ok(Vec::new());
+        };
+
+        if !is_allowed_help_command(request.command) {
+            return Ok(Vec::new());
+        }
+
+        if request.completing_command {
+            let command = command_name_suggestions_command(request.current_token);
+            let output = timeout(COMPLETION_TIMEOUT, self.exec(session_id, command))
+                .await
+                .map_err(|_| PortixError::CommandTimeout)??;
+            return Ok(parse_command_name_suggestions(&input, &request, &output));
+        }
+
+        let command = help_suggestions_command(&request.help_tokens);
+        let output = timeout(COMPLETION_TIMEOUT, self.exec(session_id, command))
+            .await
+            .map_err(|_| PortixError::CommandTimeout)??;
+        Ok(parse_help_suggestions(&input, request, &output))
+    }
+
+    pub async fn terminal_complete(
+        &self,
+        request: TerminalCompleteRequest,
+    ) -> Result<TerminalCompleteResponse> {
+        let Some(session_id) = request.session_id.clone() else {
+            return Ok(TerminalCompleteResponse {
+                suggestion: None,
+                items: Vec::new(),
+            });
+        };
+        let input = request.prefix();
+        let max_items = request.max_items();
+        let suggestions = match self
+            .command_help_suggestions(session_id.clone(), input.clone())
+            .await
+        {
+            Ok(suggestions) => suggestions,
+            Err(PortixError::CommandTimeout) => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        let suggestion = self
+            .remote_history_suggestion(session_id, input)
+            .await
+            .unwrap_or(None);
+        let mut items = suggestions
+            .into_iter()
+            .filter_map(|wire| completion_item_from_wire(&wire))
+            .take(max_items)
+            .collect::<Vec<_>>();
+        items.truncate(max_items);
+        Ok(TerminalCompleteResponse { suggestion, items })
+    }
+
+    async fn remote_history_suggestion(
+        &self,
+        session_id: String,
+        prefix: String,
+    ) -> Result<Option<String>> {
+        let prefix = prefix.trim_start().to_owned();
+        if prefix.len() < 3 || contains_shell_control(&prefix) || is_sensitive_autocomplete(&prefix)
+        {
+            return Ok(None);
+        }
+        let command = remote_history_suggestion_command(&prefix);
+        let output = timeout(COMPLETION_TIMEOUT, self.exec(session_id, command))
+            .await
+            .map_err(|_| PortixError::CommandTimeout)??;
+        let suffix = output.trim();
+        if suffix.is_empty() || is_sensitive_autocomplete(suffix) {
+            return Ok(None);
+        }
+        Ok(Some(suffix.to_owned()))
+    }
+
     pub async fn list_remote_directory(
         &self,
         session_id: String,
@@ -176,13 +265,12 @@ impl SessionManager {
         path: String,
     ) -> Result<Vec<u8>> {
         let output = self.exec(session_id, read_file_command(&path)).await?;
-        let normalized = output
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .collect::<String>();
-        Ok(general_purpose::STANDARD
-            .decode(normalized.as_bytes())
-            .unwrap_or_default())
+        let encoded = extract_portix_payload(&output, "PORTIX_FILE_BEGIN", "PORTIX_FILE_END")?;
+        general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .map_err(|error| {
+                PortixError::InvalidRequest(format!("remote download decode failed: {error}"))
+            })
     }
 
     pub async fn write_remote_file(
@@ -201,8 +289,33 @@ impl SessionManager {
         path: String,
         data: Vec<u8>,
     ) -> Result<()> {
-        self.exec(session_id, write_file_command(&path, &data))
+        let encoded = general_purpose::STANDARD.encode(&data);
+        self.exec(session_id.clone(), begin_file_upload_command(&path))
             .await?;
+        for chunk in encoded.as_bytes().chunks(UPLOAD_BASE64_CHUNK_SIZE) {
+            let chunk = std::str::from_utf8(chunk).map_err(|error| {
+                PortixError::InvalidRequest(format!("invalid upload chunk: {error}"))
+            })?;
+            self.exec(
+                session_id.clone(),
+                append_file_upload_chunk_command(&path, chunk),
+            )
+            .await?;
+        }
+        let output = self
+            .exec(session_id, finish_file_upload_command(&path, data.len()))
+            .await?;
+        if !output.lines().any(|line| line.trim() == "PORTIX_UPLOAD_OK") {
+            let detail = output
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .map(str::trim)
+                .unwrap_or("remote did not confirm upload");
+            return Err(PortixError::InvalidRequest(format!(
+                "remote upload failed: {detail}"
+            )));
+        }
         Ok(())
     }
 
@@ -374,6 +487,15 @@ fn read_file_command(path: &str) -> String {
     let quoted = shell_quote(path);
     format!(
         r#"p={quoted}
+if [ ! -f "$p" ]; then
+  printf 'PORTIX_DOWNLOAD_ERR file not found\n'
+  exit 1
+fi
+if [ ! -r "$p" ]; then
+  printf 'PORTIX_DOWNLOAD_ERR file not readable\n'
+  exit 1
+fi
+printf 'PORTIX_FILE_BEGIN\n'
 if [ -f "$p" ] && [ -r "$p" ]; then
   if command -v base64 >/dev/null 2>&1; then
     base64 "$p"
@@ -381,26 +503,91 @@ if [ -f "$p" ] && [ -r "$p" ]; then
     openssl base64 -in "$p"
   fi
 fi
+printf 'PORTIX_FILE_END\n'
 "#
     )
 }
 
 fn write_file_command(path: &str, data: &[u8]) -> String {
-    let quoted = shell_quote(path);
+    if data.is_empty() {
+        return format!(
+            "{}{}",
+            begin_file_upload_command(path),
+            finish_file_upload_command(path, 0),
+        );
+    }
     let encoded = general_purpose::STANDARD.encode(data);
     format!(
+        "{}{}{}",
+        begin_file_upload_command(path),
+        append_file_upload_chunk_command(path, &encoded),
+        finish_file_upload_command(path, data.len()),
+    )
+}
+
+fn upload_temp_path() -> &'static str {
+    "$p.portix.b64"
+}
+
+fn begin_file_upload_command(path: &str) -> String {
+    let quoted = shell_quote(path);
+    format!(
         r#"p={quoted}
-mkdir -p "$(dirname "$p")"
-cat > "$p".portix.b64 <<'PORTIX_FILE'
-{encoded}
+tmp="{tmp}"
+mkdir -p "$(dirname "$p")" || {{
+  printf 'PORTIX_UPLOAD_ERR mkdir failed\n'
+  exit 1
+}}
+: > "$tmp" || {{
+  printf 'PORTIX_UPLOAD_ERR temp file failed\n'
+  exit 1
+}}
+"#,
+        tmp = upload_temp_path(),
+    )
+}
+
+fn append_file_upload_chunk_command(path: &str, encoded_chunk: &str) -> String {
+    let quoted = shell_quote(path);
+    format!(
+        r#"p={quoted}
+tmp="{tmp}"
+cat >> "$tmp" <<'PORTIX_FILE'
+{encoded_chunk}
 PORTIX_FILE
+"#,
+        tmp = upload_temp_path(),
+    )
+}
+
+fn finish_file_upload_command(path: &str, expected_bytes: usize) -> String {
+    let quoted = shell_quote(path);
+    format!(
+        r#"p={quoted}
+tmp="{tmp}"
 if command -v base64 >/dev/null 2>&1; then
-  base64 -d "$p".portix.b64 > "$p" 2>/dev/null || base64 --decode "$p".portix.b64 > "$p"
+  if ! (base64 -d "$tmp" > "$p" 2>/dev/null || base64 --decode "$tmp" > "$p" 2>/dev/null); then
+    rm -f "$tmp"
+    printf 'PORTIX_UPLOAD_ERR base64 decode failed\n'
+    exit 1
+  fi
 else
-  openssl base64 -d -in "$p".portix.b64 -out "$p"
+  if ! openssl base64 -d -in "$tmp" -out "$p" 2>/dev/null; then
+    rm -f "$tmp"
+    printf 'PORTIX_UPLOAD_ERR openssl decode failed\n'
+    exit 1
+  fi
 fi
-rm -f "$p".portix.b64
-"#
+rm -f "$tmp"
+actual=$(wc -c < "$p" 2>/dev/null | tr -d '[:space:]')
+if [ "$actual" = "{expected_bytes}" ]; then
+  printf 'PORTIX_UPLOAD_OK\n'
+else
+  printf 'PORTIX_UPLOAD_ERR size mismatch expected={expected_bytes} actual=%s\n' "$actual"
+  exit 1
+fi
+"#,
+        tmp = upload_temp_path(),
     )
 }
 
@@ -414,6 +601,93 @@ fn chmod_command(path: &str, mode: &str) -> String {
     format!("chmod {mode} {quoted}\n")
 }
 
+fn extract_portix_payload(output: &str, begin: &str, end: &str) -> Result<String> {
+    let Some(after_begin) = output.split_once(begin).map(|(_, rest)| rest) else {
+        let detail = output
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .map(str::trim)
+            .unwrap_or("remote did not return file payload");
+        return Err(PortixError::InvalidRequest(format!(
+            "remote download failed: {detail}"
+        )));
+    };
+    let Some(payload) = after_begin.split_once(end).map(|(payload, _)| payload) else {
+        return Err(PortixError::InvalidRequest(
+            "remote download failed: incomplete file payload".to_owned(),
+        ));
+    };
+    Ok(payload
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<String>())
+}
+
+fn help_suggestions_command(tokens: &[&str]) -> String {
+    let Some(command) = tokens.first() else {
+        return String::new();
+    };
+    let quoted_command = shell_quote(command);
+    let quoted_invocation = tokens
+        .iter()
+        .map(|token| shell_quote(token))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        r#"if command -v {quoted_command} >/dev/null 2>&1; then
+  PORTIX_HELP_TIMEOUT=1
+  if command -v timeout >/dev/null 2>&1; then
+    GIT_PAGER=cat timeout "$PORTIX_HELP_TIMEOUT" {quoted_invocation} --help 2>&1 | head -c 20000
+  else
+    GIT_PAGER=cat {quoted_invocation} --help 2>&1 | head -c 20000
+  fi
+fi
+"#
+    )
+}
+
+fn command_name_suggestions_command(prefix: &str) -> String {
+    let quoted_prefix = shell_quote(prefix);
+    format!(
+        r#"PORTIX_COMPLETE_PREFIX={quoted_prefix}
+if command -v bash >/dev/null 2>&1; then
+  bash -lc 'compgen -c -- "$1" | sort -u | head -n 80' _ "$PORTIX_COMPLETE_PREFIX"
+else
+  awk -v p="$PORTIX_COMPLETE_PREFIX" 'BEGIN {{
+    n=split(ENVIRON["PATH"], dirs, ":")
+    for (i=1; i<=n; i++) {{
+      cmd="find \"" dirs[i] "\" -maxdepth 1 -type f -perm -111 -printf \"%f\n\" 2>/dev/null"
+      while ((cmd | getline name) > 0) if (index(name, p) == 1) print name
+      close(cmd)
+    }}
+  }}' | sort -u | head -n 80
+fi
+"#
+    )
+}
+
+fn remote_history_suggestion_command(prefix: &str) -> String {
+    let quoted_prefix = shell_quote(prefix);
+    format!(
+        r#"PORTIX_HISTORY_PREFIX={quoted_prefix}
+PORTIX_HISTORY_FILE="${{HISTFILE:-$HOME/.zsh_history}}"
+if [ -r "$PORTIX_HISTORY_FILE" ]; then
+  tail -n 500 "$PORTIX_HISTORY_FILE" 2>/dev/null | awk -v p="$PORTIX_HISTORY_PREFIX" '
+    {{
+      line=$0
+      sub(/^: [0-9]+:[0-9]+;/, "", line)
+      if (index(line, p) == 1 && length(line) > length(p)) match_line=line
+    }}
+    END {{
+      if (match_line != "") print substr(match_line, length(p) + 1)
+    }}
+  ' | head -n 1
+fi
+"#
+    )
+}
+
 fn shell_quote(value: &str) -> String {
     if value.trim().is_empty() || value == "~" {
         return "\"$HOME\"".to_owned();
@@ -422,6 +696,375 @@ fn shell_quote(value: &str) -> String {
         return "\".\"".to_owned();
     }
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+struct HelpSuggestionRequest<'a> {
+    command: &'a str,
+    help_tokens: Vec<&'a str>,
+    current_token: &'a str,
+    completing_command: bool,
+    completing_option: bool,
+}
+
+impl<'a> HelpSuggestionRequest<'a> {
+    fn parse(input: &'a str) -> Option<Self> {
+        let trimmed = input.trim_start();
+        if trimmed.len() < 2 || contains_shell_control(trimmed) {
+            return None;
+        }
+
+        let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+        let command = tokens.first().copied()?;
+        if !is_safe_command_name(command) {
+            return None;
+        }
+
+        let current_token = if trimmed.ends_with(char::is_whitespace) {
+            ""
+        } else {
+            trimmed.split_whitespace().last().unwrap_or("")
+        };
+        let completing_command = tokens.len() == 1 && !trimmed.ends_with(char::is_whitespace);
+        let completing_option = current_token.starts_with('-');
+        let mut help_tokens = vec![command];
+        if let Some(subcommand) = tokens.get(1).copied() {
+            let subcommand_is_current =
+                !trimmed.ends_with(char::is_whitespace) && current_token == subcommand;
+            if !subcommand_is_current
+                && is_safe_command_name(subcommand)
+                && !subcommand.starts_with('-')
+            {
+                help_tokens.push(subcommand);
+            }
+        }
+
+        Some(Self {
+            command,
+            help_tokens,
+            current_token,
+            completing_command,
+            completing_option,
+        })
+    }
+}
+
+fn contains_shell_control(value: &str) -> bool {
+    value
+        .chars()
+        .any(|char| matches!(char, ';' | '&' | '|' | '`' | '$' | '<' | '>' | '\n' | '\r'))
+}
+
+fn is_safe_command_name(value: &str) -> bool {
+    if value.is_empty() || value.len() > 64 || value.contains('/') {
+        return false;
+    }
+    value
+        .chars()
+        .all(|char| char.is_ascii_alphanumeric() || matches!(char, '-' | '_' | '.' | '+'))
+}
+
+fn is_allowed_help_command(command: &str) -> bool {
+    const BLOCKED: &[&str] = &[
+        "bash", "cat", "dd", "env", "fish", "ftp", "nc", "netcat", "perl", "python", "python3",
+        "ruby", "scp", "sh", "sftp", "socat", "ssh", "sshpass", "sudo", "su", "zsh",
+    ];
+    !BLOCKED.contains(&command)
+}
+
+fn is_sensitive_autocomplete(value: &str) -> bool {
+    let lower = value.to_lowercase();
+    lower.contains("password")
+        || lower.contains("passphrase")
+        || lower.contains("passwd")
+        || lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("private_key")
+        || lower.contains("sshpass")
+        || lower.contains("sudo -s")
+        || lower.contains("sudo -S")
+        || lower.contains("--password")
+        || lower.contains("--token")
+        || lower.contains("--secret")
+}
+
+fn parse_help_suggestions(
+    input: &str,
+    request: HelpSuggestionRequest<'_>,
+    output: &str,
+) -> Vec<String> {
+    let mut suggestions = if request.completing_option {
+        parse_option_candidates(input, &request, output)
+    } else {
+        parse_subcommand_candidates(input, &request, output)
+    };
+
+    if suggestions.is_empty() {
+        suggestions = parse_option_candidates(input, &request, output);
+    }
+
+    suggestions.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    suggestions.dedup();
+    suggestions.truncate(12);
+    suggestions
+}
+
+fn parse_command_name_suggestions(
+    input: &str,
+    request: &HelpSuggestionRequest<'_>,
+    output: &str,
+) -> Vec<String> {
+    let mut suggestions = output
+        .lines()
+        .map(str::trim)
+        .filter(|candidate| {
+            !candidate.is_empty()
+                && candidate.starts_with(request.current_token)
+                && is_safe_command_name(candidate)
+        })
+        .map(|candidate| {
+            encode_completion_candidate(
+                &replace_current_token(input, candidate),
+                candidate,
+                "PATH command",
+                "command",
+            )
+        })
+        .collect::<Vec<_>>();
+    suggestions.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    suggestions.dedup();
+    suggestions.truncate(24);
+    suggestions
+}
+
+fn completion_item_from_wire(value: &str) -> Option<CompletionItem> {
+    const PREFIX: &str = "PORTIX_COMPLETION\t";
+    if !value.starts_with(PREFIX) {
+        let label = value.trim();
+        if label.is_empty() {
+            return None;
+        }
+        return Some(CompletionItem {
+            label: label.to_owned(),
+            insert_text: label.to_owned(),
+            kind: CompletionKind::History,
+            description: None,
+            score: 20,
+        });
+    }
+
+    let mut parts = value[PREFIX.len()..].split('\t');
+    let replacement = parts.next()?.trim();
+    if replacement.is_empty() {
+        return None;
+    }
+    let display = parts.next().map(str::trim).filter(|part| !part.is_empty());
+    let description = parts.next().map(str::trim).filter(|part| !part.is_empty());
+    let source = parts.next().map(str::trim).unwrap_or_default();
+    let kind = match source {
+        "command" => CompletionKind::Command,
+        "path" => CompletionKind::Path,
+        "directory" => CompletionKind::Directory,
+        "file" => CompletionKind::File,
+        "env" => CompletionKind::Env,
+        "git" => CompletionKind::Git,
+        "help" => CompletionKind::Command,
+        _ => CompletionKind::Command,
+    };
+    let token = display.unwrap_or(replacement);
+    Some(CompletionItem {
+        label: token.to_owned(),
+        insert_text: token.to_owned(),
+        kind,
+        description: description.map(str::to_owned),
+        score: if source == "command" { 90 } else { 80 },
+    })
+}
+
+fn parse_option_candidates(
+    input: &str,
+    request: &HelpSuggestionRequest<'_>,
+    output: &str,
+) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(clean_help_option_line)
+        .filter(|candidate| {
+            request.current_token.is_empty() || candidate.token.starts_with(request.current_token)
+        })
+        .map(|candidate| {
+            encode_completion_candidate(
+                &replace_current_token(input, &candidate.token),
+                &candidate.token,
+                &candidate.description,
+                "help",
+            )
+        })
+        .filter(|suggestion| !suggestion.trim().is_empty())
+        .collect()
+}
+
+fn parse_subcommand_candidates(
+    input: &str,
+    request: &HelpSuggestionRequest<'_>,
+    output: &str,
+) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(clean_help_subcommand_line)
+        .filter(|candidate| {
+            request.current_token.is_empty() || candidate.token.starts_with(request.current_token)
+        })
+        .map(|candidate| {
+            encode_completion_candidate(
+                &replace_current_token(input, &candidate.token),
+                &candidate.token,
+                &candidate.description,
+                "help",
+            )
+        })
+        .collect()
+}
+
+struct HelpCandidate {
+    token: String,
+    description: String,
+}
+
+fn clean_help_option_line(line: &str) -> Option<HelpCandidate> {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with('-') {
+        return None;
+    }
+    let tokens = trimmed
+        .split(|char: char| char.is_whitespace() || matches!(char, ',' | '[' | ']'))
+        .filter(|part| part.starts_with('-'))
+        .collect::<Vec<_>>();
+    let raw_token = tokens
+        .iter()
+        .find(|part| part.starts_with("--"))
+        .or_else(|| tokens.first())?;
+    let token = clean_help_option(raw_token)?.to_owned();
+    let description = description_after_token(trimmed, raw_token).unwrap_or("command option");
+    Some(HelpCandidate {
+        token,
+        description: normalize_description(description),
+    })
+}
+
+fn clean_help_subcommand_line(line: &str) -> Option<HelpCandidate> {
+    let trimmed = line.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('-')
+        || trimmed.starts_with("usage")
+        || trimmed.starts_with("Usage")
+        || trimmed.starts_with("Examples")
+        || trimmed.starts_with("Options")
+    {
+        return None;
+    }
+
+    let mut split = trimmed.splitn(2, |char: char| char.is_whitespace());
+    let token = split.next()?.trim();
+    if !is_safe_command_name(token) || token.len() < 2 || token.starts_with('-') {
+        return None;
+    }
+    let description = split.next()?.trim();
+    if description.len() < 3 {
+        return None;
+    }
+
+    Some(HelpCandidate {
+        token: token.to_owned(),
+        description: normalize_description(description),
+    })
+}
+
+fn description_after_token<'a>(line: &'a str, raw_token: &str) -> Option<&'a str> {
+    let index = line.find(raw_token)? + raw_token.len();
+    let rest = line[index..]
+        .trim_start_matches(|char: char| char == ',' || char.is_whitespace())
+        .trim_start_matches(|char: char| {
+            char.is_ascii_alphanumeric() || matches!(char, '<' | '>' | '[' | ']' | '=' | '-' | '_')
+        })
+        .trim_start();
+    if rest.is_empty() { None } else { Some(rest) }
+}
+
+fn normalize_description(value: &str) -> String {
+    value
+        .trim_matches(|char: char| matches!(char, '-' | ':' | ';' | ',' | '.'))
+        .split_whitespace()
+        .take(18)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn encode_completion_candidate(
+    replacement: &str,
+    display: &str,
+    description: &str,
+    source: &str,
+) -> String {
+    format!(
+        "PORTIX_COMPLETION\t{}\t{}\t{}\t{}",
+        sanitize_completion_field(replacement),
+        sanitize_completion_field(display),
+        sanitize_completion_field(description),
+        sanitize_completion_field(source)
+    )
+}
+
+fn sanitize_completion_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|char| {
+            if matches!(char, '\t' | '\n' | '\r') {
+                ' '
+            } else {
+                char
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+fn clean_help_option(raw: &str) -> Option<&str> {
+    let option = raw
+        .trim_matches(|char: char| matches!(char, ':' | ';' | '.' | '=' | '"' | '\''))
+        .trim();
+    if option.len() < 2 || option.len() > 48 {
+        return None;
+    }
+    if !option.starts_with('-') {
+        return None;
+    }
+    if option.chars().all(|char| char == '-') {
+        return None;
+    }
+    if option
+        .chars()
+        .any(|char| !char.is_ascii_alphanumeric() && !matches!(char, '-' | '_' | '.'))
+    {
+        return None;
+    }
+    Some(option)
+}
+
+fn replace_current_token(input: &str, option: &str) -> String {
+    let trimmed_end = input.trim_end();
+    let starts_new_token = input.ends_with(char::is_whitespace);
+    if starts_new_token {
+        return format!("{trimmed_end}{option}");
+    }
+
+    let token_start = trimmed_end
+        .rfind(char::is_whitespace)
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    format!("{}{}", &trimmed_end[..token_start], option)
 }
 
 fn parse_remote_system_snapshot(output: &str) -> RemoteSystemSnapshot {

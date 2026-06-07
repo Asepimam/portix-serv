@@ -36,6 +36,8 @@ pub struct SshRuntime {
 
 struct Client;
 
+type ExecRequest = (String, oneshot::Sender<Result<String>>);
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 const MIN_COLS: u32 = 20;
@@ -84,6 +86,8 @@ impl SshRuntime {
             .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
             .await?;
         channel.request_shell(true).await?;
+        let (exec_tx, exec_rx) = mpsc::channel::<ExecRequest>(64);
+        tokio::spawn(run_exec_worker(self.profile.clone(), exec_rx));
         self.emit_status(ConnectionStatus::Connected, Some("connected"));
 
         loop {
@@ -96,8 +100,10 @@ impl SshRuntime {
                             channel.window_change(cols, rows, 0, 0).await?
                         },
                         Some(SshCommand::Exec { command, response_tx }) => {
-                            let result = run_exec(&session, command).await;
-                            let _ = response_tx.send(result);
+                            exec_tx
+                                .send((command, response_tx))
+                                .await
+                                .map_err(|_| PortixError::SessionNotFound(self.session_id.clone()))?;
                         }
                         Some(SshCommand::Disconnect) | None => {
                             channel.eof().await.ok();
@@ -126,45 +132,7 @@ impl SshRuntime {
     }
 
     async fn connect_and_authenticate(&self) -> Result<client::Handle<Client>> {
-        let config = Arc::new(client::Config {
-            inactivity_timeout: None,
-            ..Default::default()
-        });
-        let mut session = timeout(
-            CONNECT_TIMEOUT,
-            client::connect(config, self.profile.socket_addr(), Client),
-        )
-        .await
-        .map_err(|_| PortixError::ConnectionTimeout)??;
-
-        let auth_result = timeout(AUTH_TIMEOUT, async {
-            if let Some(path) = self.profile.private_key_path.as_deref() {
-                let key_path = expand_user_path(path);
-                let key_pair = load_secret_key(key_path, None)?;
-                session
-                    .authenticate_publickey(
-                        self.profile.username.clone(),
-                        PrivateKeyWithHashAlg::new(
-                            Arc::new(key_pair),
-                            session.best_supported_rsa_hash().await?.flatten(),
-                        ),
-                    )
-                    .await
-            } else if let Some(password) = self.profile.password.clone() {
-                session
-                    .authenticate_password(self.profile.username.clone(), password)
-                    .await
-            } else {
-                Err(russh::Error::NotAuthenticated)
-            }
-        })
-        .await
-        .map_err(|_| PortixError::AuthenticationTimeout)??;
-
-        if !auth_result.success() {
-            return Err(PortixError::AuthenticationFailed);
-        }
-        Ok(session)
+        connect_and_authenticate_profile(&self.profile).await
     }
 
     fn emit_status(&self, status: ConnectionStatus, message: Option<&str>) {
@@ -188,6 +156,7 @@ async fn run_exec(session: &client::Handle<Client>, command: String) -> Result<S
     let mut channel = session.channel_open_session().await?;
     channel.exec(true, command).await?;
     let mut output = Vec::new();
+    let mut exit_status = None;
 
     while let Some(msg) = channel.wait().await {
         match msg {
@@ -195,13 +164,100 @@ async fn run_exec(session: &client::Handle<Client>, command: String) -> Result<S
                 output.extend_from_slice(&data);
             }
             ChannelMsg::Eof | ChannelMsg::Close => break,
-            ChannelMsg::ExitStatus { .. } => break,
+            ChannelMsg::ExitStatus {
+                exit_status: status,
+            } => {
+                exit_status = Some(status);
+            }
             _ => {}
         }
     }
 
     channel.close().await.ok();
-    Ok(String::from_utf8_lossy(&output).to_string())
+    let output = String::from_utf8_lossy(&output).to_string();
+    if let Some(status) = exit_status
+        && status != 0
+    {
+        let detail = output
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .map(str::trim)
+            .unwrap_or("remote command failed");
+        return Err(PortixError::InvalidRequest(format!(
+            "remote command exited with {status}: {detail}"
+        )));
+    }
+    Ok(output)
+}
+
+async fn run_exec_worker(profile: SshProfile, mut rx: mpsc::Receiver<ExecRequest>) {
+    let mut session = connect_and_authenticate_profile(&profile).await.ok();
+    while let Some((command, response_tx)) = rx.recv().await {
+        if session.is_none() {
+            session = connect_and_authenticate_profile(&profile).await.ok();
+        }
+
+        let result = if let Some(handle) = session.as_ref() {
+            let result = run_exec(handle, command.clone()).await;
+            if result.is_err() {
+                session = None;
+            }
+            result
+        } else {
+            Err(PortixError::ConnectionTimeout)
+        };
+        let _ = response_tx.send(result);
+    }
+
+    if let Some(handle) = session {
+        handle
+            .disconnect(Disconnect::ByApplication, "", "en")
+            .await
+            .ok();
+    }
+}
+
+async fn connect_and_authenticate_profile(profile: &SshProfile) -> Result<client::Handle<Client>> {
+    let config = Arc::new(client::Config {
+        inactivity_timeout: None,
+        ..Default::default()
+    });
+    let mut session = timeout(
+        CONNECT_TIMEOUT,
+        client::connect(config, profile.socket_addr(), Client),
+    )
+    .await
+    .map_err(|_| PortixError::ConnectionTimeout)??;
+
+    let auth_result = timeout(AUTH_TIMEOUT, async {
+        if let Some(path) = profile.private_key_path.as_deref() {
+            let key_path = expand_user_path(path);
+            let key_pair = load_secret_key(key_path, None)?;
+            session
+                .authenticate_publickey(
+                    profile.username.clone(),
+                    PrivateKeyWithHashAlg::new(
+                        Arc::new(key_pair),
+                        session.best_supported_rsa_hash().await?.flatten(),
+                    ),
+                )
+                .await
+        } else if let Some(password) = profile.password.clone() {
+            session
+                .authenticate_password(profile.username.clone(), password)
+                .await
+        } else {
+            Err(russh::Error::NotAuthenticated)
+        }
+    })
+    .await
+    .map_err(|_| PortixError::AuthenticationTimeout)??;
+
+    if !auth_result.success() {
+        return Err(PortixError::AuthenticationFailed);
+    }
+    Ok(session)
 }
 
 fn normalize_terminal_size(cols: u32, rows: u32) -> (u32, u32) {

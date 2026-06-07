@@ -4,6 +4,8 @@ use thiserror::Error;
 pub enum PortixError {
     #[error("invalid profile: {0}")]
     InvalidProfile(String),
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
     #[error("session not found: {0}")]
     SessionNotFound(String),
     #[error("authentication failed")]
@@ -14,6 +16,8 @@ pub enum PortixError {
     ConnectionTimeout,
     #[error("authentication timed out")]
     AuthenticationTimeout,
+    #[error("remote command timed out")]
+    CommandTimeout,
     #[error(transparent)]
     Russh(#[from] russh::Error),
     #[error(transparent)]
