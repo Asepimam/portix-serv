@@ -395,43 +395,38 @@ fi
 printf 'OS=%s\n' "$os"
 printf 'HOST=%s\n' "$(hostname 2>/dev/null)"
 printf 'UPTIME=%s\n' "$(uptime 2>/dev/null)"
-awk '
-  /MemTotal:/ {total=$2 * 1024}
-  /MemFree:/ {mem_free=$2 * 1024}
-  /Buffers:/ {buffers=$2 * 1024}
-  /^Cached:/ {cached=$2 * 1024}
-  /MemAvailable:/ {available=$2 * 1024}
-  END {
-    if (available == 0) available = mem_free + buffers + cached
-    used = total - available
-    if (used < 0) used = 0
-    printf "MEM=%s / %s\n", human(used), human(total)
-    printf "MEM_USED_BYTES=%.0f\nMEM_FREE_BYTES=%.0f\nMEM_TOTAL_BYTES=%.0f\n", used, available, total
-  }
-  function human(bytes, value, unit) {
-    value = bytes
-    unit = "B"
-    if (value >= 1024) { value = value / 1024; unit = "KB" }
-    if (value >= 1024) { value = value / 1024; unit = "MB" }
-    if (value >= 1024) { value = value / 1024; unit = "GB" }
-    return sprintf("%.1f %s", value, unit)
-  }
-' /proc/meminfo 2>/dev/null
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+  _mem_total=$(sysctl -n hw.memsize 2>/dev/null)
+  _page_size=$(sysctl -n hw.pagesize 2>/dev/null || echo 4096)
+  _vm_stat=$(vm_stat 2>/dev/null)
+  _pages_free=$(echo "$_vm_stat" | awk '/Pages free:/ {gsub(/\./,"",$3); print $3}')
+  _pages_inactive=$(echo "$_vm_stat" | awk '/Pages inactive:/ {gsub(/\./,"",$3); print $3}')
+  _pages_purgeable=$(echo "$_vm_stat" | awk '/Pages purgeable:/ {gsub(/\./,"",$3); print $3}')
+  _mem_free=$(( (_pages_free + _pages_inactive + _pages_purgeable) * _page_size ))
+  _mem_used=$(( _mem_total - _mem_free ))
+  if [ "$_mem_used" -lt 0 ] 2>/dev/null; then _mem_used=0; fi
+  printf "MEM_USED_BYTES=%s\nMEM_FREE_BYTES=%s\nMEM_TOTAL_BYTES=%s\n" "$_mem_used" "$_mem_free" "$_mem_total"
+else
+  awk '
+    /MemTotal:/ {total=$2 * 1024}
+    /MemFree:/ {mem_free=$2 * 1024}
+    /Buffers:/ {buffers=$2 * 1024}
+    /^Cached:/ {cached=$2 * 1024}
+    /MemAvailable:/ {available=$2 * 1024}
+    END {
+      if (available == 0) available = mem_free + buffers + cached
+      used = total - available
+      if (used < 0) used = 0
+      printf "MEM_USED_BYTES=%.0f\nMEM_FREE_BYTES=%.0f\nMEM_TOTAL_BYTES=%.0f\n", used, available, total
+    }
+  ' /proc/meminfo 2>/dev/null
+fi
 df -P -k / 2>/dev/null | awk '
   NR==2 {
     total=$2 * 1024
     used=$3 * 1024
     free=$4 * 1024
-    printf "DISK=%s free / %s\n", human(free), human(total)
     printf "DISK_USED_BYTES=%.0f\nDISK_FREE_BYTES=%.0f\nDISK_TOTAL_BYTES=%.0f\n", used, free, total
-  }
-  function human(bytes, value, unit) {
-    value = bytes
-    unit = "B"
-    if (value >= 1024) { value = value / 1024; unit = "KB" }
-    if (value >= 1024) { value = value / 1024; unit = "MB" }
-    if (value >= 1024) { value = value / 1024; unit = "GB" }
-    return sprintf("%.1f %s", value, unit)
   }
 '
 true
@@ -449,14 +444,14 @@ if [ -d "$p" ]; then
     rm -f /tmp/portix_ls_$$
   else
     rm -f /tmp/portix_ls_$$
-    for item in "$p"/.[!.]* "$p"/..?* "$p"/*; do
-      [ -e "$item" ] || continue
-      name=$(basename "$item")
-      modified=$(stat -c %Y "$item" 2>/dev/null || stat -f %m "$item" 2>/dev/null || printf 0)
+    ls -1A "$p" 2>/dev/null | while IFS= read -r name; do
+      [ -z "$name" ] && continue
+      item="$p/$name"
+      modified=$(stat -c %Y "$item" 2>/dev/null || stat -f %m "$item" 2>/dev/null || printf '0')
       if [ -d "$item" ]; then
         printf 'd\t0\t%s\t%s\t%s\n' "$modified" "$name" "$item"
       else
-        size=$(wc -c < "$item" 2>/dev/null || printf 0)
+        size=$(stat -c %s "$item" 2>/dev/null || stat -f %z "$item" 2>/dev/null || printf '0')
         printf 'f\t%s\t%s\t%s\t%s\n' "$size" "$modified" "$name" "$item"
       fi
     done
