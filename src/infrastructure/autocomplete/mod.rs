@@ -3,6 +3,7 @@ pub mod command;
 pub mod env;
 pub mod git;
 pub mod history;
+pub mod option;
 pub mod path;
 
 use command::CommandProvider;

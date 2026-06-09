@@ -6,6 +6,7 @@ use crate::domain::autocomplete::{
 use crate::domain::errors::{PortixError, Result};
 use crate::infrastructure::autocomplete::AutocompleteProviders;
 use crate::infrastructure::autocomplete::env::EnvProvider;
+use crate::infrastructure::autocomplete::option::OptionProvider;
 
 pub struct AutocompleteService {
     providers: AutocompleteProviders,
@@ -58,6 +59,22 @@ impl AutocompleteService {
                     )
                     .await?,
             );
+        } else if should_complete_option(&context) {
+            if let Some(command) = context.command.as_deref() {
+                items.extend(OptionProvider::complete(
+                    command,
+                    &context.current_token,
+                    max_items,
+                ));
+            }
+        } else if should_complete_subcommand(&context) {
+            if let Some(command) = context.command.as_deref() {
+                items.extend(OptionProvider::complete(
+                    command,
+                    &context.current_token,
+                    max_items,
+                ));
+            }
         } else if should_complete_command(&context) {
             items.extend(
                 self.providers
@@ -96,6 +113,24 @@ impl Default for AutocompleteService {
 
 fn should_complete_command(context: &crate::domain::autocomplete::CompletionContext) -> bool {
     context.token_index == 0 && !context.prefix.ends_with(char::is_whitespace)
+}
+
+fn should_complete_option(context: &crate::domain::autocomplete::CompletionContext) -> bool {
+    context.token_index > 0 && context.current_token.starts_with('-')
+}
+
+fn should_complete_subcommand(context: &crate::domain::autocomplete::CompletionContext) -> bool {
+    context.token_index == 1
+        && !context.current_token.starts_with('-')
+        && !context.current_token.starts_with('.')
+        && !context.current_token.starts_with('/')
+        && !context.current_token.starts_with('~')
+        && !context.current_token.contains('/')
+        && matches!(
+            context.command.as_deref(),
+            Some("docker" | "systemctl" | "apt" | "apt-get" | "yum" | "dnf"
+                | "npm" | "cargo" | "pip" | "pip3")
+        )
 }
 
 fn should_complete_path(context: &crate::domain::autocomplete::CompletionContext) -> bool {
