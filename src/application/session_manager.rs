@@ -31,6 +31,15 @@ const UPLOAD_BASE64_CHUNK_SIZE: usize = 12 * 1024;
 #[derive(Clone)]
 struct ManagedSession {
     command_tx: mpsc::Sender<SshCommand>,
+    /// None = not yet detected, Some(platform) = cached
+    remote_platform: Arc<RwLock<Option<RemotePlatform>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemotePlatform {
+    Unix,
+    WindowsCmd,
+    WindowsPowerShell,
 }
 
 impl SessionManager {
@@ -69,10 +78,13 @@ impl SessionManager {
             status: ConnectionStatus::Connecting,
         };
 
-        self.sessions
-            .write()
-            .await
-            .insert(session_id.clone(), ManagedSession { command_tx });
+        self.sessions.write().await.insert(
+            session_id.clone(),
+            ManagedSession {
+                command_tx,
+                remote_platform: Arc::new(RwLock::new(None)),
+            },
+        );
         self.emit_status(
             &session_id,
             ConnectionStatus::Connecting,
@@ -148,7 +160,13 @@ impl SessionManager {
     }
 
     pub async fn remote_system_snapshot(&self, session_id: String) -> Result<RemoteSystemSnapshot> {
-        let output = self.exec(session_id, remote_system_command()).await?;
+        let is_windows = self.is_remote_windows(&session_id).await;
+        let command = if is_windows {
+            remote_system_command_windows()
+        } else {
+            remote_system_command()
+        };
+        let output = self.exec(session_id, command).await?;
         Ok(parse_remote_system_snapshot(&output))
     }
 
@@ -239,7 +257,12 @@ impl SessionManager {
         session_id: String,
         path: String,
     ) -> Result<Vec<RemoteFileEntry>> {
-        let command = list_directory_command(&path);
+        let is_windows = self.is_remote_windows(&session_id).await;
+        let command = if is_windows {
+            list_directory_command_windows(&path)
+        } else {
+            list_directory_command(&path)
+        };
         let output = self.exec(session_id, command).await?;
         Ok(parse_remote_directory(&path, &output))
     }
@@ -249,7 +272,12 @@ impl SessionManager {
         session_id: String,
         path: String,
     ) -> Result<String> {
-        let command = resolve_directory_command(&path);
+        let is_windows = self.is_remote_windows(&session_id).await;
+        let command = if is_windows {
+            resolve_directory_command_windows(&path)
+        } else {
+            resolve_directory_command(&path)
+        };
         let output = self.exec(session_id, command).await?;
         Ok(resolve_directory_from_output(&path, &output))
     }
@@ -264,7 +292,13 @@ impl SessionManager {
         session_id: String,
         path: String,
     ) -> Result<Vec<u8>> {
-        let output = self.exec(session_id, read_file_command(&path)).await?;
+        let is_windows = self.is_remote_windows(&session_id).await;
+        let command = if is_windows {
+            read_file_command_windows(&path)
+        } else {
+            read_file_command(&path)
+        };
+        let output = self.exec(session_id, command).await?;
         let encoded = extract_portix_payload(&output, "PORTIX_FILE_BEGIN", "PORTIX_FILE_END")?;
         general_purpose::STANDARD
             .decode(encoded.as_bytes())
@@ -289,6 +323,12 @@ impl SessionManager {
         path: String,
         data: Vec<u8>,
     ) -> Result<()> {
+        let is_windows = self.is_remote_windows(&session_id).await;
+        if is_windows {
+            return self
+                .upload_remote_file_windows(session_id, path, data)
+                .await;
+        }
         let encoded = general_purpose::STANDARD.encode(&data);
         self.exec(session_id.clone(), begin_file_upload_command(&path))
             .await?;
@@ -319,15 +359,101 @@ impl SessionManager {
         Ok(())
     }
 
-    pub async fn create_remote_directory(&self, session_id: String, path: String) -> Result<()> {
-        self.exec(session_id, create_directory_command(&path))
+    async fn upload_remote_file_windows(
+        &self,
+        session_id: String,
+        path: String,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        let encoded = general_purpose::STANDARD.encode(&data);
+        let escaped_path = path.replace('\'', "''");
+        let temp_path = format!("{}.portix.b64", &path);
+        let escaped_temp = temp_path.replace('\'', "''");
+
+        // Clear temp file
+        let clear_script = format!(
+            "Set-Content -Path '{}' -Value '' -NoNewline",
+            escaped_temp
+        );
+        self.exec(session_id.clone(), encode_powershell_command(&clear_script))
             .await?;
+
+        // Write chunks
+        for chunk in encoded.as_bytes().chunks(UPLOAD_BASE64_CHUNK_SIZE) {
+            let chunk_str = std::str::from_utf8(chunk).map_err(|error| {
+                PortixError::InvalidRequest(format!("invalid upload chunk: {error}"))
+            })?;
+            let append_script = format!(
+                "Add-Content -Path '{}' -Value '{}' -NoNewline",
+                escaped_temp, chunk_str
+            );
+            self.exec(session_id.clone(), encode_powershell_command(&append_script))
+                .await?;
+        }
+
+        // Decode and write final file
+        let finish_script = format!(
+            r#"
+$b64 = Get-Content -Path '{escaped_temp}' -Raw
+$bytes = [Convert]::FromBase64String($b64)
+[IO.File]::WriteAllBytes('{escaped_path}', $bytes)
+Remove-Item -Path '{escaped_temp}' -Force -ErrorAction SilentlyContinue
+if ((Get-Item '{escaped_path}').Length -eq {expected}) {{
+  Write-Output 'PORTIX_UPLOAD_OK'
+}} else {{
+  Write-Output ('PORTIX_UPLOAD_ERR size mismatch expected={expected} actual=' + (Get-Item '{escaped_path}').Length)
+}}
+"#,
+            expected = data.len()
+        );
+        let output = self
+            .exec(session_id, encode_powershell_command(&finish_script))
+            .await?;
+        if !output.lines().any(|line| line.trim() == "PORTIX_UPLOAD_OK") {
+            let detail = output
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .map(str::trim)
+                .unwrap_or("remote did not confirm upload");
+            return Err(PortixError::InvalidRequest(format!(
+                "remote upload failed: {detail}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub async fn create_remote_directory(&self, session_id: String, path: String) -> Result<()> {
+        let is_windows = self.is_remote_windows(&session_id).await;
+        let command = if is_windows {
+            let escaped = path.replace('\'', "''");
+            encode_powershell_command(&format!(
+                "New-Item -ItemType Directory -Path '{}' -Force | Out-Null",
+                escaped
+            ))
+        } else {
+            create_directory_command(&path)
+        };
+        self.exec(session_id, command).await?;
         Ok(())
     }
 
     pub async fn create_remote_file(&self, session_id: String, path: String) -> Result<()> {
-        self.exec(session_id, write_file_command(&path, &[]))
+        let is_windows = self.is_remote_windows(&session_id).await;
+        if is_windows {
+            let escaped = path.replace('\'', "''");
+            self.exec(
+                session_id,
+                encode_powershell_command(&format!(
+                    "New-Item -ItemType File -Path '{}' -Force | Out-Null",
+                    escaped
+                )),
+            )
             .await?;
+        } else {
+            self.exec(session_id, write_file_command(&path, &[]))
+                .await?;
+        }
         Ok(())
     }
 
@@ -337,6 +463,10 @@ impl SessionManager {
         path: String,
         mode: String,
     ) -> Result<()> {
+        // chmod is not available on Windows
+        if self.is_remote_windows(&session_id).await {
+            return Ok(());
+        }
         let trimmed = mode.trim();
         if trimmed.len() != 3 && trimmed.len() != 4 {
             return Err(PortixError::InvalidProfile(
@@ -384,6 +514,74 @@ impl SessionManager {
             message: message.map(str::to_owned),
         });
     }
+
+    /// Detect if the remote host is Windows.
+    /// Works for both cmd.exe and PowerShell default shells.
+    /// Result is cached per session to avoid repeated detection.
+    async fn is_remote_windows(&self, session_id: &str) -> bool {
+        let platform = self.detect_remote_platform(session_id).await;
+        matches!(
+            platform,
+            RemotePlatform::WindowsCmd | RemotePlatform::WindowsPowerShell
+        )
+    }
+
+    async fn detect_remote_platform(&self, session_id: &str) -> RemotePlatform {
+        // Check cache first
+        if let Ok(session) = self.session(session_id).await {
+            let cached = session.remote_platform.read().await;
+            if let Some(platform) = *cached {
+                return platform;
+            }
+        }
+
+        // Detection strategy:
+        // 1. Try `echo $PSVersionTable.PSVersion` — if it returns a version, it's PowerShell
+        // 2. Try `echo %OS%` — if it returns Windows_NT, it's cmd.exe
+        // 3. Otherwise it's Unix
+        let result = self
+            .exec(
+                session_id.to_owned(),
+                "echo PORTIX_DETECT && echo %OS% && echo $env:OS".to_owned(),
+            )
+            .await;
+
+        let platform = match result {
+            Ok(output) => {
+                let lines: Vec<&str> = output.lines().map(str::trim).collect();
+                // Check if %OS% was expanded (cmd.exe) or $env:OS returned value (PowerShell)
+                let has_windows_nt = lines
+                    .iter()
+                    .any(|line| line.contains("Windows_NT"));
+                let has_unexpanded_percent = lines
+                    .iter()
+                    .any(|line| *line == "%OS%");
+                let _has_unexpanded_env = lines
+                    .iter()
+                    .any(|line| *line == "$env:OS");
+
+                if has_windows_nt && !has_unexpanded_percent {
+                    // %OS% expanded to Windows_NT → cmd.exe shell
+                    RemotePlatform::WindowsCmd
+                } else if has_windows_nt && has_unexpanded_percent {
+                    // $env:OS returned Windows_NT but %OS% didn't expand → PowerShell
+                    RemotePlatform::WindowsPowerShell
+                } else {
+                    RemotePlatform::Unix
+                }
+            }
+            Err(_) => RemotePlatform::Unix,
+        };
+
+        // Store in cache
+        if let Ok(session) = self.session(session_id).await {
+            let mut cached = session.remote_platform.write().await;
+            *cached = Some(platform);
+        }
+
+        platform
+    }
+
 }
 
 fn remote_system_command() -> String {
@@ -432,6 +630,84 @@ df -P -k / 2>/dev/null | awk '
 true
 "#
     .to_owned()
+}
+
+fn remote_system_command_windows() -> String {
+    // Use PowerShell encoded command to avoid quoting issues with cmd.exe wrapping.
+    let ps_script = r#"
+$os = (Get-CimInstance Win32_OperatingSystem).Caption
+$host_ = $env:COMPUTERNAME
+$upObj = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+$up = (New-TimeSpan -Start $upObj -End (Get-Date))
+$upStr = '{0}d {1}h {2}m' -f $up.Days, $up.Hours, $up.Minutes
+$mem = Get-CimInstance Win32_OperatingSystem
+$memTotal = $mem.TotalVisibleMemorySize * 1024
+$memFree = $mem.FreePhysicalMemory * 1024
+$memUsed = $memTotal - $memFree
+$disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+$diskTotal = $disk.Size
+$diskFree = $disk.FreeSpace
+$diskUsed = $diskTotal - $diskFree
+Write-Output "OS=$os"
+Write-Output "HOST=$host_"
+Write-Output "UPTIME=$upStr"
+Write-Output "MEM_USED_BYTES=$([math]::Max(0, $memUsed))"
+Write-Output "MEM_FREE_BYTES=$([math]::Max(0, $memFree))"
+Write-Output "MEM_TOTAL_BYTES=$([math]::Max(0, $memTotal))"
+Write-Output "DISK_USED_BYTES=$([math]::Max(0, $diskUsed))"
+Write-Output "DISK_FREE_BYTES=$([math]::Max(0, $diskFree))"
+Write-Output "DISK_TOTAL_BYTES=$([math]::Max(0, $diskTotal))"
+"#;
+    encode_powershell_command(ps_script)
+}
+
+/// Encode a PowerShell script as a base64 UTF-16LE encoded command.
+/// This avoids all quoting/escaping issues when launching via cmd.exe or PowerShell.
+fn encode_powershell_command(script: &str) -> String {
+    let utf16: Vec<u8> = script
+        .encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
+    let encoded = general_purpose::STANDARD.encode(&utf16);
+    format!("powershell -NoProfile -EncodedCommand {encoded}")
+}
+
+fn list_directory_command_windows(path: &str) -> String {
+    let ps_script = format!(
+        r#"
+$p = '{}'
+if (Test-Path $p -PathType Container) {{
+  Get-ChildItem -Path $p -Force | ForEach-Object {{
+    $kind = if ($_.PSIsContainer) {{ 'd' }} else {{ 'f' }}
+    $size = if ($_.PSIsContainer) {{ 0 }} else {{ $_.Length }}
+    $mod = [int][double]::Parse((Get-Date $_.LastWriteTimeUtc -UFormat '%s'))
+    $name = $_.Name
+    $full = $_.FullName
+    Write-Output "$kind`t$size`t$mod`t$name`t$full"
+  }}
+}}
+"#,
+        path.replace('\'', "''")
+    );
+    encode_powershell_command(&ps_script)
+}
+
+fn resolve_directory_command_windows(path: &str) -> String {
+    let ps_script = format!(
+        r#"
+$p = '{}'
+if (Test-Path $p -PathType Container) {{
+  Write-Output (Resolve-Path $p).Path
+}} else {{
+  $parent = Split-Path $p -Parent
+  Get-ChildItem -Path $parent -Directory -Force | ForEach-Object {{
+    Write-Output "$($_.Name)`t$($_.FullName)"
+  }}
+}}
+"#,
+        path.replace('\'', "''")
+    );
+    encode_powershell_command(&ps_script)
 }
 
 fn list_directory_command(path: &str) -> String {
@@ -501,6 +777,23 @@ fi
 printf 'PORTIX_FILE_END\n'
 "#
     )
+}
+
+fn read_file_command_windows(path: &str) -> String {
+    let ps_script = format!(
+        r#"
+$p = '{}'
+if (-not (Test-Path $p -PathType Leaf)) {{
+  Write-Output 'PORTIX_DOWNLOAD_ERR file not found'
+  exit 1
+}}
+Write-Output 'PORTIX_FILE_BEGIN'
+[Convert]::ToBase64String([IO.File]::ReadAllBytes($p))
+Write-Output 'PORTIX_FILE_END'
+"#,
+        path.replace('\'', "''")
+    );
+    encode_powershell_command(&ps_script)
 }
 
 fn write_file_command(path: &str, data: &[u8]) -> String {
