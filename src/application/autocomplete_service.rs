@@ -61,11 +61,12 @@ impl AutocompleteService {
             );
         } else if should_complete_option(&context) {
             if let Some(command) = context.command.as_deref() {
-                items.extend(OptionProvider::complete(
-                    command,
-                    &context.current_token,
-                    max_items,
-                ));
+                let token = if context.current_token.is_empty() {
+                    "-" // Show all options when no token typed yet
+                } else {
+                    &context.current_token
+                };
+                items.extend(OptionProvider::complete(command, token, max_items));
             }
         } else if should_complete_subcommand(&context) {
             if let Some(command) = context.command.as_deref() {
@@ -101,7 +102,19 @@ impl AutocompleteService {
         }
 
         let items = ranked_dedup(items, max_items);
-        Ok(TerminalCompleteResponse { suggestion, items })
+
+        // If no history suggestion, try option inline suggestion (e.g. "-lr" → "th")
+        let final_suggestion = if suggestion.is_some() {
+            suggestion
+        } else if should_complete_option(&context) {
+            context.command.as_deref().and_then(|cmd| {
+                OptionProvider::inline_suggestion(cmd, &context.current_token)
+            })
+        } else {
+            None
+        };
+
+        Ok(TerminalCompleteResponse { suggestion: final_suggestion, items })
     }
 }
 
@@ -116,21 +129,53 @@ fn should_complete_command(context: &crate::domain::autocomplete::CompletionCont
 }
 
 fn should_complete_option(context: &crate::domain::autocomplete::CompletionContext) -> bool {
-    context.token_index > 0 && context.current_token.starts_with('-')
+    if context.token_index == 0 {
+        return false;
+    }
+    // Trigger option completion when:
+    // - Token starts with '-' (user typing a flag)
+    // - Token is empty and command has known options (user just pressed space)
+    let token = &context.current_token;
+    if token.starts_with('-') {
+        return true;
+    }
+    if token.is_empty() {
+        // Only show options hint if command is known
+        if let Some(cmd) = context.command.as_deref() {
+            return matches!(
+                cmd,
+                "ls" | "grep" | "rg" | "find" | "chmod" | "chown" | "cp" | "mv" | "rm"
+                    | "mkdir" | "cat" | "tail" | "head" | "less" | "tar" | "zip" | "gzip"
+                    | "curl" | "wget" | "ssh" | "scp" | "rsync" | "ps" | "kill"
+                    | "pgrep" | "pkill" | "du" | "df" | "awk" | "sed" | "jq"
+                    | "xargs" | "sort" | "uniq" | "wc" | "cut" | "watch"
+                    | "ss" | "lsof" | "ip" | "ping" | "dig" | "openssl" | "ufw"
+                    | "nginx" | "make" | "psql" | "mysql" | "crontab"
+            );
+        }
+    }
+    false
 }
 
 fn should_complete_subcommand(context: &crate::domain::autocomplete::CompletionContext) -> bool {
-    context.token_index == 1
-        && !context.current_token.starts_with('-')
-        && !context.current_token.starts_with('.')
-        && !context.current_token.starts_with('/')
-        && !context.current_token.starts_with('~')
-        && !context.current_token.contains('/')
-        && matches!(
-            context.command.as_deref(),
-            Some("docker" | "systemctl" | "apt" | "apt-get" | "yum" | "dnf"
-                | "npm" | "cargo" | "pip" | "pip3")
-        )
+    // Show subcommands/options when token_index > 0 and either:
+    // - current_token is empty (user pressed space after command)
+    // - current_token doesn't look like a path
+    let token = &context.current_token;
+    if context.token_index == 0 {
+        return false;
+    }
+    if token.starts_with('-') || token.starts_with('.') || token.starts_with('/')
+        || token.starts_with('~') || token.contains('/') || token.starts_with('$') {
+        return false;
+    }
+    matches!(
+        context.command.as_deref(),
+        Some("docker" | "docker compose" | "systemctl" | "journalctl" | "kubectl"
+            | "apt" | "apt-get" | "yum" | "dnf" | "npm" | "cargo" | "pip" | "pip3"
+            | "git" | "python" | "python3" | "redis-cli" | "tmux" | "make"
+            | "openssl" | "ufw")
+    )
 }
 
 fn should_complete_path(context: &crate::domain::autocomplete::CompletionContext) -> bool {

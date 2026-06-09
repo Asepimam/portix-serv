@@ -57,9 +57,32 @@ pub async fn terminal_complete(req_json: String) -> anyhow::Result<String> {
         .map_err(|error| PortixError::InvalidRequest(error.to_string()))?;
     if request.session_id.is_some() {
         let mut response = SESSION_MANAGER.terminal_complete(request.clone()).await?;
-        if response.items.is_empty() && response.suggestion.is_none() {
-            response = AUTOCOMPLETE_SERVICE.complete(request).await?;
+        // Always merge local static completions (options, paths, etc.)
+        let local = AUTOCOMPLETE_SERVICE.complete(request).await?;
+        if response.suggestion.is_none() {
+            response.suggestion = local.suggestion;
         }
+        // Merge: local static options first (more concise descriptions),
+        // then remote completions fill remaining slots.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut merged = Vec::new();
+        for item in local.items {
+            if merged.len() >= 24 {
+                break;
+            }
+            if seen.insert(item.insert_text.clone()) {
+                merged.push(item);
+            }
+        }
+        for item in response.items {
+            if merged.len() >= 24 {
+                break;
+            }
+            if seen.insert(item.insert_text.clone()) {
+                merged.push(item);
+            }
+        }
+        response.items = merged;
         return Ok(serde_json::to_string(&response)?);
     }
     Ok(AUTOCOMPLETE_SERVICE
