@@ -194,13 +194,20 @@ async fn run_exec(session: &client::Handle<Client>, command: String) -> Result<S
 async fn run_exec_worker(profile: SshProfile, mut rx: mpsc::Receiver<ExecRequest>) {
     let mut session = connect_and_authenticate_profile(&profile).await.ok();
     while let Some((command, response_tx)) = rx.recv().await {
+        // Try to establish session if not connected (with one retry).
         if session.is_none() {
             session = connect_and_authenticate_profile(&profile).await.ok();
+            if session.is_none() {
+                // Retry once after a brief delay.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                session = connect_and_authenticate_profile(&profile).await.ok();
+            }
         }
 
         let result = if let Some(handle) = session.as_ref() {
             let result = run_exec(handle, command.clone()).await;
             if result.is_err() {
+                // Connection might be broken — try a fresh one for the next request.
                 session = None;
             }
             result
@@ -267,20 +274,38 @@ fn normalize_terminal_size(cols: u32, rows: u32) -> (u32, u32) {
     )
 }
 
+/// Returns the user's home directory, supporting both Unix (HOME) and Windows (USERPROFILE).
+fn home_dir() -> Option<PathBuf> {
+    env::var("HOME")
+        .or_else(|_| env::var("USERPROFILE"))
+        .ok()
+        .map(PathBuf::from)
+}
+
 fn expand_user_path(path: &str) -> PathBuf {
-    if path == "~" {
-        if let Ok(home) = env::var("HOME") {
-            return PathBuf::from(home);
+    // Normalize forward slashes on Windows so PathBuf joins work correctly.
+    let normalized = if cfg!(windows) {
+        path.replace('/', "\\")
+    } else {
+        path.to_owned()
+    };
+
+    if normalized == "~" || normalized == "~\\" {
+        if let Some(home) = home_dir() {
+            return home;
         }
     }
 
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = env::var("HOME") {
-            return PathBuf::from(home).join(rest);
+    if let Some(rest) = normalized
+        .strip_prefix("~/")
+        .or_else(|| normalized.strip_prefix("~\\"))
+    {
+        if let Some(home) = home_dir() {
+            return home.join(rest);
         }
     }
 
-    PathBuf::from(path)
+    PathBuf::from(normalized)
 }
 
 #[cfg(test)]
