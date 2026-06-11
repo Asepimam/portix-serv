@@ -492,10 +492,7 @@ fn known_options(command: &str) -> &'static [(&'static str, &'static str)] {
             ("enable", "enable firewall"),
             ("disable", "disable firewall"),
         ],
-        "nginx" => &[
-            ("-t", "test config syntax"),
-            ("-s reload", "signal reload"),
-        ],
+        "nginx" => &[("-t", "test config syntax"), ("-s reload", "signal reload")],
         "make" => &[
             ("test", "run test target"),
             ("build", "run build target"),

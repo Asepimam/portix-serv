@@ -371,10 +371,7 @@ impl SessionManager {
         let escaped_temp = temp_path.replace('\'', "''");
 
         // Clear temp file
-        let clear_script = format!(
-            "Set-Content -Path '{}' -Value '' -NoNewline",
-            escaped_temp
-        );
+        let clear_script = format!("Set-Content -Path '{}' -Value '' -NoNewline", escaped_temp);
         self.exec(session_id.clone(), encode_powershell_command(&clear_script))
             .await?;
 
@@ -387,8 +384,11 @@ impl SessionManager {
                 "Add-Content -Path '{}' -Value '{}' -NoNewline",
                 escaped_temp, chunk_str
             );
-            self.exec(session_id.clone(), encode_powershell_command(&append_script))
-                .await?;
+            self.exec(
+                session_id.clone(),
+                encode_powershell_command(&append_script),
+            )
+            .await?;
         }
 
         // Decode and write final file
@@ -550,15 +550,9 @@ if ((Get-Item '{escaped_path}').Length -eq {expected}) {{
             Ok(output) => {
                 let lines: Vec<&str> = output.lines().map(str::trim).collect();
                 // Check if %OS% was expanded (cmd.exe) or $env:OS returned value (PowerShell)
-                let has_windows_nt = lines
-                    .iter()
-                    .any(|line| line.contains("Windows_NT"));
-                let has_unexpanded_percent = lines
-                    .iter()
-                    .any(|line| *line == "%OS%");
-                let _has_unexpanded_env = lines
-                    .iter()
-                    .any(|line| *line == "$env:OS");
+                let has_windows_nt = lines.iter().any(|line| line.contains("Windows_NT"));
+                let has_unexpanded_percent = lines.iter().any(|line| *line == "%OS%");
+                let _has_unexpanded_env = lines.iter().any(|line| *line == "$env:OS");
 
                 if has_windows_nt && !has_unexpanded_percent {
                     // %OS% expanded to Windows_NT → cmd.exe shell
@@ -581,7 +575,6 @@ if ((Get-Item '{escaped_path}').Length -eq {expected}) {{
 
         platform
     }
-
 }
 
 fn remote_system_command() -> String {

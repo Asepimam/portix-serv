@@ -90,14 +90,7 @@ impl RdpSessionManager {
         let sid = session_id.clone();
 
         tokio::spawn(async move {
-            let runtime = RdpRuntime::new(profile, sid.clone(), frame_tx);
-
-            // Emit connected once the runtime starts the active session
-            let _ = status_tx.send(ConnectionStatusEvent {
-                session_id: sid.clone(),
-                status: ConnectionStatus::Connected,
-                message: Some("connected".to_owned()),
-            });
+            let runtime = RdpRuntime::new(profile, sid.clone(), frame_tx, status_tx.clone());
 
             let result = runtime.run(command_rx).await;
 
@@ -202,6 +195,7 @@ impl RdpSessionManager {
             .map_err(|_| PortixError::SessionNotFound(session_id.clone()))?;
         response_rx
             .await
+            .map(|frame| (*frame).clone())
             .map_err(|_| PortixError::SessionNotFound(session_id))
     }
 
@@ -212,5 +206,11 @@ impl RdpSessionManager {
             .get(session_id)
             .cloned()
             .ok_or_else(|| PortixError::SessionNotFound(session_id.to_owned()))
+    }
+}
+
+impl Default for RdpSessionManager {
+    fn default() -> Self {
+        Self::new()
     }
 }

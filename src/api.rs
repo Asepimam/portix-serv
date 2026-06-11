@@ -250,7 +250,9 @@ pub async fn rdp_send_mouse_button(
 
 /// Send mouse move event to an RDP session.
 pub async fn rdp_send_mouse_move(session_id: String, x: u16, y: u16) -> anyhow::Result<()> {
-    Ok(RDP_SESSION_MANAGER.send_mouse_move(session_id, x, y).await?)
+    Ok(RDP_SESSION_MANAGER
+        .send_mouse_move(session_id, x, y)
+        .await?)
 }
 
 /// Request the current frame buffer as raw RGBA bytes.
