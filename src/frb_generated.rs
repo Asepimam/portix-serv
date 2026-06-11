@@ -26,7 +26,7 @@
 // Section: imports
 
 use flutter_rust_bridge::for_generated::byteorder::{NativeEndian, ReadBytesExt, WriteBytesExt};
-use flutter_rust_bridge::for_generated::{transform_result_dco, Lifetimeable, Lockable};
+use flutter_rust_bridge::for_generated::{Lifetimeable, Lockable, transform_result_dco};
 use flutter_rust_bridge::{Handler, IntoIntoDart};
 
 // Section: boilerplate
@@ -37,7 +37,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.11.1";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 159080834;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1792063259;
 
 // Section: executor
 
@@ -461,6 +461,45 @@ fn wire__crate__api__parse_rdp_file_impl(
         },
     )
 }
+fn wire__crate__api__rdp_clipboard_stream_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "rdp_clipboard_stream",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_sink =
+                <StreamSink<String, flutter_rust_bridge::for_generated::SseCodec>>::sse_decode(
+                    &mut deserializer,
+                );
+            deserializer.end();
+            move |context| async move {
+                transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || async move {
+                        let output_ok = crate::api::rdp_clipboard_stream(api_sink).await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
 fn wire__crate__api__rdp_connect_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -808,6 +847,44 @@ fn wire__crate__api__rdp_send_mouse_move_impl(
                     (move || async move {
                         let output_ok =
                             crate::api::rdp_send_mouse_move(api_session_id, api_x, api_y).await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__rdp_set_clipboard_text_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "rdp_set_clipboard_text",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_session_id = <String>::sse_decode(&mut deserializer);
+            let api_text = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| async move {
+                transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || async move {
+                        let output_ok =
+                            crate::api::rdp_set_clipboard_text(api_session_id, api_text).await?;
                         Ok(output_ok)
                     })()
                     .await,
@@ -1521,27 +1598,29 @@ fn pde_ffi_dispatcher_primary_impl(
         9 => wire__crate__api__init_app_impl(port, ptr, rust_vec_len, data_len),
         10 => wire__crate__api__list_remote_directory_impl(port, ptr, rust_vec_len, data_len),
         11 => wire__crate__api__parse_rdp_file_impl(port, ptr, rust_vec_len, data_len),
-        12 => wire__crate__api__rdp_connect_impl(port, ptr, rust_vec_len, data_len),
-        13 => {
+        12 => wire__crate__api__rdp_clipboard_stream_impl(port, ptr, rust_vec_len, data_len),
+        13 => wire__crate__api__rdp_connect_impl(port, ptr, rust_vec_len, data_len),
+        14 => {
             wire__crate__api__rdp_connection_status_stream_impl(port, ptr, rust_vec_len, data_len)
         }
-        14 => wire__crate__api__rdp_disconnect_impl(port, ptr, rust_vec_len, data_len),
-        15 => wire__crate__api__rdp_error_event_stream_impl(port, ptr, rust_vec_len, data_len),
-        16 => wire__crate__api__rdp_frame_stream_impl(port, ptr, rust_vec_len, data_len),
-        17 => wire__crate__api__rdp_request_frame_impl(port, ptr, rust_vec_len, data_len),
-        18 => wire__crate__api__rdp_send_keyboard_impl(port, ptr, rust_vec_len, data_len),
-        19 => wire__crate__api__rdp_send_mouse_button_impl(port, ptr, rust_vec_len, data_len),
-        20 => wire__crate__api__rdp_send_mouse_move_impl(port, ptr, rust_vec_len, data_len),
-        21 => wire__crate__api__read_remote_file_impl(port, ptr, rust_vec_len, data_len),
-        22 => wire__crate__api__read_remote_file_bytes_impl(port, ptr, rust_vec_len, data_len),
-        23 => wire__crate__api__remote_system_snapshot_impl(port, ptr, rust_vec_len, data_len),
-        24 => wire__crate__api__resize_terminal_impl(port, ptr, rust_vec_len, data_len),
-        25 => wire__crate__api__resolve_remote_directory_impl(port, ptr, rust_vec_len, data_len),
-        26 => wire__crate__api__send_terminal_input_impl(port, ptr, rust_vec_len, data_len),
-        27 => wire__crate__api__terminal_complete_impl(port, ptr, rust_vec_len, data_len),
-        28 => wire__crate__api__terminal_output_stream_impl(port, ptr, rust_vec_len, data_len),
-        29 => wire__crate__api__upload_remote_file_impl(port, ptr, rust_vec_len, data_len),
-        30 => wire__crate__api__write_remote_file_impl(port, ptr, rust_vec_len, data_len),
+        15 => wire__crate__api__rdp_disconnect_impl(port, ptr, rust_vec_len, data_len),
+        16 => wire__crate__api__rdp_error_event_stream_impl(port, ptr, rust_vec_len, data_len),
+        17 => wire__crate__api__rdp_frame_stream_impl(port, ptr, rust_vec_len, data_len),
+        18 => wire__crate__api__rdp_request_frame_impl(port, ptr, rust_vec_len, data_len),
+        19 => wire__crate__api__rdp_send_keyboard_impl(port, ptr, rust_vec_len, data_len),
+        20 => wire__crate__api__rdp_send_mouse_button_impl(port, ptr, rust_vec_len, data_len),
+        21 => wire__crate__api__rdp_send_mouse_move_impl(port, ptr, rust_vec_len, data_len),
+        22 => wire__crate__api__rdp_set_clipboard_text_impl(port, ptr, rust_vec_len, data_len),
+        23 => wire__crate__api__read_remote_file_impl(port, ptr, rust_vec_len, data_len),
+        24 => wire__crate__api__read_remote_file_bytes_impl(port, ptr, rust_vec_len, data_len),
+        25 => wire__crate__api__remote_system_snapshot_impl(port, ptr, rust_vec_len, data_len),
+        26 => wire__crate__api__resize_terminal_impl(port, ptr, rust_vec_len, data_len),
+        27 => wire__crate__api__resolve_remote_directory_impl(port, ptr, rust_vec_len, data_len),
+        28 => wire__crate__api__send_terminal_input_impl(port, ptr, rust_vec_len, data_len),
+        29 => wire__crate__api__terminal_complete_impl(port, ptr, rust_vec_len, data_len),
+        30 => wire__crate__api__terminal_output_stream_impl(port, ptr, rust_vec_len, data_len),
+        31 => wire__crate__api__upload_remote_file_impl(port, ptr, rust_vec_len, data_len),
+        32 => wire__crate__api__write_remote_file_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -1985,7 +2064,7 @@ mod io {
     use flutter_rust_bridge::for_generated::byteorder::{
         NativeEndian, ReadBytesExt, WriteBytesExt,
     };
-    use flutter_rust_bridge::for_generated::{transform_result_dco, Lifetimeable, Lockable};
+    use flutter_rust_bridge::for_generated::{Lifetimeable, Lockable, transform_result_dco};
     use flutter_rust_bridge::{Handler, IntoIntoDart};
 
     // Section: boilerplate
@@ -2009,7 +2088,7 @@ mod web {
     };
     use flutter_rust_bridge::for_generated::wasm_bindgen;
     use flutter_rust_bridge::for_generated::wasm_bindgen::prelude::*;
-    use flutter_rust_bridge::for_generated::{transform_result_dco, Lifetimeable, Lockable};
+    use flutter_rust_bridge::for_generated::{Lifetimeable, Lockable, transform_result_dco};
     use flutter_rust_bridge::{Handler, IntoIntoDart};
 
     // Section: boilerplate

@@ -88,10 +88,7 @@ impl RdpProfile {
             ));
         }
 
-        let username = settings
-            .get("username")
-            .cloned()
-            .unwrap_or_default();
+        let username = settings.get("username").cloned().unwrap_or_default();
 
         let domain = settings.get("domain").cloned().filter(|d| !d.is_empty());
 
@@ -211,16 +208,16 @@ mod tests {
     #[test]
     fn parse_rdp_file_basic() {
         let content = r#"
-full address:s:192.168.1.100:3389
-username:s:admin
+full address:s:testhost:3389
+username:s:testuser
 desktopwidth:i:1920
 desktopheight:i:1080
 screen mode id:i:2
 "#;
         let profile = RdpProfile::from_rdp_file("test-1".into(), "Test".into(), content).unwrap();
-        assert_eq!(profile.host, "192.168.1.100");
+        assert_eq!(profile.host, "testhost");
         assert_eq!(profile.port, 3389);
-        assert_eq!(profile.username, "admin");
+        assert_eq!(profile.username, "testuser");
         assert_eq!(profile.width, 1920);
         assert_eq!(profile.height, 1080);
         assert_eq!(profile.screen_mode, 2);
@@ -274,8 +271,7 @@ desktopwidth:i:1280
 desktopheight:i:720
 screen mode id:i:1
 "#;
-        let profile =
-            RdpProfile::from_rdp_file("rt".into(), "Roundtrip".into(), content).unwrap();
+        let profile = RdpProfile::from_rdp_file("rt".into(), "Roundtrip".into(), content).unwrap();
         let output = profile.to_rdp_file_content();
         assert!(output.contains("full address:s:server.local:3390"));
         assert!(output.contains("username:s:admin"));
