@@ -255,6 +255,13 @@ pub async fn rdp_send_mouse_move(session_id: String, x: u16, y: u16) -> anyhow::
         .await?)
 }
 
+/// Publish local Unicode clipboard text to an RDP session.
+pub async fn rdp_set_clipboard_text(session_id: String, text: String) -> anyhow::Result<()> {
+    Ok(RDP_SESSION_MANAGER
+        .set_clipboard_text(session_id, text)
+        .await?)
+}
+
 /// Request the current frame buffer as raw RGBA bytes.
 pub async fn rdp_request_frame(session_id: String) -> anyhow::Result<Vec<u8>> {
     Ok(RDP_SESSION_MANAGER.request_frame(session_id).await?)
@@ -263,6 +270,15 @@ pub async fn rdp_request_frame(session_id: String) -> anyhow::Result<Vec<u8>> {
 /// Stream RDP frame updates (region updates as JSON).
 pub async fn rdp_frame_stream(sink: StreamSink<String>) -> anyhow::Result<()> {
     let mut rx = RDP_SESSION_MANAGER.frame_stream();
+    tokio::spawn(async move {
+        forward_json_stream(&mut rx, sink).await;
+    });
+    Ok(())
+}
+
+/// Stream Unicode clipboard text copied inside active RDP sessions.
+pub async fn rdp_clipboard_stream(sink: StreamSink<String>) -> anyhow::Result<()> {
+    let mut rx = RDP_SESSION_MANAGER.clipboard_stream();
     tokio::spawn(async move {
         forward_json_stream(&mut rx, sink).await;
     });

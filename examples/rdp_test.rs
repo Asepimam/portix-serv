@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use portix_serv::domain::events::ConnectionStatusEvent;
 use portix_serv::domain::rdp_profile::RdpProfile;
-use portix_serv::infrastructure::rdp_client::{RdpCommand, RdpFrameEvent, RdpRuntime};
+use portix_serv::infrastructure::rdp_client::{
+    RdpClipboardEvent, RdpCommand, RdpFrameEvent, RdpRuntime,
+};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 #[tokio::main]
@@ -42,6 +44,13 @@ async fn main() {
     let mut extra = HashMap::new();
     extra.insert("portix_debug".to_owned(), "1".to_owned());
     extra.insert("portix_stream_pixels".to_owned(), "0".to_owned());
+    if let Ok(path) = std::env::var("PORTIX_RDP_TEST_DRIVE_PATH") {
+        extra.insert("portix_drive_path".to_owned(), path);
+        extra.insert(
+            "portix_drive_name".to_owned(),
+            std::env::var("PORTIX_RDP_TEST_DRIVE_NAME").unwrap_or_else(|_| "PORTIX".to_owned()),
+        );
+    }
 
     let profile = RdpProfile {
         id: "test-1".to_owned(),
@@ -63,11 +72,12 @@ async fn main() {
     );
 
     let (frame_tx, mut frame_rx) = broadcast::channel::<RdpFrameEvent>(4);
+    let (clipboard_tx, _clipboard_rx) = broadcast::channel::<RdpClipboardEvent>(4);
     let (status_tx, mut status_rx) = broadcast::channel::<ConnectionStatusEvent>(16);
     let (command_tx, command_rx) = mpsc::channel::<RdpCommand>(32);
 
     let session_id = "test-session".to_owned();
-    let runtime = RdpRuntime::new(profile, session_id, frame_tx, status_tx);
+    let runtime = RdpRuntime::new(profile, session_id, frame_tx, clipboard_tx, status_tx);
 
     // Spawn the RDP connection
     let handle = tokio::spawn(async move {

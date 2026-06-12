@@ -12,6 +12,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_rustls::rustls;
 
 use crate::domain::rdp_profile::RdpProfile;
+use crate::infrastructure::rdpdr::RdpdrState;
 
 fn rdp_log_line(message: impl AsRef<str>) {
     eprintln!("{}", message.as_ref());
@@ -31,6 +32,8 @@ pub enum RdpCommand {
     },
     /// Send mouse move
     MouseMove { x: u16, y: u16 },
+    /// Announce new local Unicode clipboard text to the remote session.
+    SetClipboardText { text: String },
     /// Request current frame buffer as RGBA bytes (zero-copy Arc)
     RequestFrame {
         response_tx: oneshot::Sender<Arc<Vec<u8>>>,
@@ -60,6 +63,12 @@ pub struct RdpFrameEvent {
     pub full_frame: bool,
     /// RGBA pixel data for this full frame or dirty region.
     pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RdpClipboardEvent {
+    pub session_id: String,
+    pub text: String,
 }
 
 // ─── High-Performance Framebuffer ────────────────────────────────────────────
@@ -655,6 +664,7 @@ pub struct RdpRuntime {
     pub session_id: String,
     pub profile: RdpProfile,
     pub frame_tx: broadcast::Sender<RdpFrameEvent>,
+    pub clipboard_tx: broadcast::Sender<RdpClipboardEvent>,
     pub status_tx: broadcast::Sender<crate::domain::events::ConnectionStatusEvent>,
 }
 
@@ -663,12 +673,14 @@ impl RdpRuntime {
         profile: RdpProfile,
         session_id: String,
         frame_tx: broadcast::Sender<RdpFrameEvent>,
+        clipboard_tx: broadcast::Sender<RdpClipboardEvent>,
         status_tx: broadcast::Sender<crate::domain::events::ConnectionStatusEvent>,
     ) -> Self {
         Self {
             session_id,
             profile,
             frame_tx,
+            clipboard_tx,
             status_tx,
         }
     }
@@ -680,9 +692,10 @@ impl RdpRuntime {
         let frame_policy = FramePolicy::from_profile(&self.profile);
         let keep_awake_policy = KeepAwakePolicy::from_profile(&self.profile);
         let auto_unlock_policy = AutoUnlockPolicy::from_profile(&self.profile);
+        let drive_policy = DriveRedirectionPolicy::from_profile(&self.profile);
         let mut debug_stats = RdpDebugStats::new(&self.profile);
         debug_stats.log_connect(format!(
-            "target={addr} requested_size={}x{} fps={} stream_pixels={} keep_awake={} keep_awake_interval={}s auto_unlock={}",
+            "target={addr} requested_size={}x{} fps={} stream_pixels={} keep_awake={} keep_awake_interval={}s auto_unlock={} drive={} drive_name={}",
             width,
             height,
             self.profile
@@ -694,6 +707,8 @@ impl RdpRuntime {
             keep_awake_policy.enabled,
             keep_awake_policy.interval.as_secs(),
             auto_unlock_policy.enabled,
+            drive_policy.enabled(),
+            drive_policy.name,
         ));
 
         // Allow up to 3 connection attempts (initial + 2 reconnects for post-login reactivation)
@@ -809,6 +824,20 @@ impl RdpRuntime {
                 return Err(anyhow::anyhow!("Server closed during MCS Connect"));
             }
             debug_stats.log_connect(format!("mcs_connect_response={}B", n));
+            let cliprdr_channel_id = parse_server_static_channel_id(&buf[..n], 0);
+            let rdpdr_channel_id = drive_policy
+                .enabled()
+                .then(|| parse_server_static_channel_id(&buf[..n], 1))
+                .flatten();
+            debug_stats.log_connect(format!(
+                "cliprdr_channel_id={} rdpdr_channel_id={}",
+                cliprdr_channel_id
+                    .map(|channel| channel.to_string())
+                    .unwrap_or_else(|| "unavailable".to_owned()),
+                rdpdr_channel_id
+                    .map(|channel| channel.to_string())
+                    .unwrap_or_else(|| "unavailable".to_owned()),
+            ));
 
             // ─── MCS Erect Domain + Attach User ──────────────────────────────
             tls_stream.write_all(&build_mcs_erect_domain()).await?;
@@ -822,7 +851,14 @@ impl RdpRuntime {
             debug_stats.log_connect(format!("user_channel_id={user_channel_id}"));
 
             // ─── Channel Joins ────────────────────────────────────────────────
-            for channel in [user_channel_id, 1003u16] {
+            let mut channels = vec![user_channel_id, 1003u16];
+            if let Some(channel_id) = cliprdr_channel_id {
+                channels.push(channel_id);
+            }
+            if let Some(channel_id) = rdpdr_channel_id {
+                channels.push(channel_id);
+            }
+            for channel in channels {
                 tls_stream
                     .write_all(&build_mcs_channel_join(user_channel_id, channel))
                     .await?;
@@ -920,6 +956,27 @@ impl RdpRuntime {
             auto_unlock_tick.tick().await;
             let mut decode_scratch = DecodeScratch::default();
             let mut fastpath_fragments = FastPathFragmentState::default();
+            let mut clipboard_state = ClipboardChannelState {
+                debug: debug_stats.enabled,
+                ..ClipboardChannelState::default()
+            };
+            let mut rdpdr_state =
+                drive_policy.root.as_ref().and_then(|root| {
+                    match RdpdrState::new(
+                        root.clone(),
+                        drive_policy.name.clone(),
+                        debug_stats.enabled,
+                    ) {
+                        Ok(state) => Some(state),
+                        Err(error) => {
+                            rdp_log_line(format!(
+                                "RDP drive: unable to map {}: {error}",
+                                root.display()
+                            ));
+                            None
+                        }
+                    }
+                });
             let mut pending_cmd: Option<RdpCommand> = None;
             let mut auto_unlock_state = if auto_unlock_policy.enabled {
                 AutoUnlockState::CheckBlank {
@@ -959,6 +1016,46 @@ impl RdpRuntime {
                                             let _ = tls_stream.write_all(&ca).await;
                                             let ss = build_synchronize_sequence(user_channel_id);
                                             let _ = tls_stream.write_all(&ss).await;
+                                            None
+                                        } else if let Some(clip_channel_id) = cliprdr_channel_id
+                                            && server_mcs_channel_id(&pdu_buf[..pdu_len])
+                                                == Some(clip_channel_id)
+                                        {
+                                            let result = process_cliprdr_packet(
+                                                &pdu_buf[..pdu_len],
+                                                user_channel_id,
+                                                clip_channel_id,
+                                                &mut clipboard_state,
+                                            );
+                                            for response in result.responses {
+                                                tls_stream.write_all(&response).await?;
+                                            }
+                                            if let Some(text) = result.remote_text {
+                                                let _ = self.clipboard_tx.send(RdpClipboardEvent {
+                                                    session_id: self.session_id.clone(),
+                                                    text,
+                                                });
+                                            }
+                                            None
+                                        } else if let Some(drive_channel_id) = rdpdr_channel_id
+                                            && server_mcs_channel_id(&pdu_buf[..pdu_len])
+                                                == Some(drive_channel_id)
+                                        {
+                                            if let Some(state) = rdpdr_state.as_mut()
+                                                && let Some((_, payload)) =
+                                                    server_mcs_payload(&pdu_buf[..pdu_len])
+                                            {
+                                                let result = state.process_channel_payload(payload);
+                                                for message in result.messages {
+                                                    for response in build_static_channel_message_pdus(
+                                                        user_channel_id,
+                                                        drive_channel_id,
+                                                        &message,
+                                                    ) {
+                                                        tls_stream.write_all(&response).await?;
+                                                    }
+                                                }
+                                            }
                                             None
                                         } else {
                                             process_incoming_pdu(&pdu_buf[..pdu_len])
@@ -1141,6 +1238,17 @@ impl RdpRuntime {
                                 frame_pacer.record_input();
                                 let pdu = build_mouse_button_pdu(user_channel_id, x, y, button, is_pressed);
                                 let _ = tls_stream.write_all(&pdu).await;
+                            }
+                            Some(RdpCommand::SetClipboardText { text }) => {
+                                clipboard_state.local_text = text;
+                                if let Some(channel_id) = cliprdr_channel_id {
+                                    for pdu in build_cliprdr_format_list(
+                                        user_channel_id,
+                                        channel_id,
+                                    ) {
+                                        tls_stream.write_all(&pdu).await?;
+                                    }
+                                }
                             }
                             Some(RdpCommand::RequestFrame { response_tx }) => {
                                 debug_stats.frame_requests += 1;
@@ -1396,11 +1504,21 @@ fn build_mcs_connect_initial(profile: &RdpProfile, selected_protocol: u8) -> Vec
     sec.extend_from_slice(&0x0000001Bu32.to_le_bytes()); // encryptionMethods
     sec.extend_from_slice(&0u32.to_le_bytes()); // extEncryptionMethods
 
-    // Client Network Data (TS_UD_CS_NET) - 8 bytes (no virtual channels for MVP)
+    // Client Network Data (TS_UD_CS_NET) with clipboard and optional drive redirection.
+    let drive_enabled = DriveRedirectionPolicy::from_profile(profile).enabled();
+    let channel_count = if drive_enabled { 2u32 } else { 1u32 };
     let mut net = Vec::new();
     net.extend_from_slice(&0xC003u16.to_le_bytes());
-    net.extend_from_slice(&8u16.to_le_bytes());
-    net.extend_from_slice(&0u32.to_le_bytes()); // channelCount = 0
+    net.extend_from_slice(&(8u16 + channel_count as u16 * 12).to_le_bytes());
+    net.extend_from_slice(&channel_count.to_le_bytes());
+    net.extend_from_slice(CLIPRDR_CHANNEL_NAME);
+    // INITIALIZED | ENCRYPT_RDP | COMPRESS_RDP | SHOW_PROTOCOL
+    net.extend_from_slice(&0xC0A0_0000u32.to_le_bytes());
+    if drive_enabled {
+        net.extend_from_slice(RDPDR_CHANNEL_NAME);
+        // INITIALIZED | ENCRYPT_RDP | COMPRESS_RDP
+        net.extend_from_slice(&0xC080_0000u32.to_le_bytes());
+    }
 
     let user_data = [&core[..], &cluster[..], &sec[..], &net[..]].concat();
     let gcc = build_gcc_wrapper(&user_data);
@@ -1576,10 +1694,21 @@ fn build_client_info_pdu(user_channel_id: u16, profile: &RdpProfile) -> Vec<u8> 
         .flat_map(|c| c.to_le_bytes())
         .collect();
 
+    let alt_shell = profile
+        .extra
+        .get("alternate shell")
+        .or_else(|| profile.extra.get("alternate_shell"))
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let alt_shell_utf16: Vec<u8> = alt_shell
+        .encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
+
     info.extend_from_slice(&(domain_utf16.len() as u16).to_le_bytes());
     info.extend_from_slice(&(username_utf16.len() as u16).to_le_bytes());
     info.extend_from_slice(&(password_utf16.len() as u16).to_le_bytes());
-    info.extend_from_slice(&0u16.to_le_bytes()); // AlternateShell length
+    info.extend_from_slice(&(alt_shell_utf16.len() as u16).to_le_bytes()); // AlternateShell length
     info.extend_from_slice(&0u16.to_le_bytes()); // WorkingDir length
 
     info.extend_from_slice(&domain_utf16);
@@ -1588,13 +1717,14 @@ fn build_client_info_pdu(user_channel_id: u16, profile: &RdpProfile) -> Vec<u8> 
     info.extend_from_slice(&[0, 0]);
     info.extend_from_slice(&password_utf16);
     info.extend_from_slice(&[0, 0]);
+    info.extend_from_slice(&alt_shell_utf16);
     info.extend_from_slice(&[0, 0]); // AlternateShell null
     info.extend_from_slice(&[0, 0]); // WorkingDir null
 
     // TS_EXTENDED_INFO_PACKET (required by xrdp 0.10+)
     info.extend_from_slice(&2u16.to_le_bytes()); // clientAddressFamily: AF_INET
     // cbClientAddress (including null terminator, in bytes)
-    let client_addr = "127.0.0.1";
+    let client_addr = "localhost";
     let addr_utf16: Vec<u8> = client_addr
         .encode_utf16()
         .flat_map(|c| c.to_le_bytes())
@@ -1634,10 +1764,15 @@ fn client_info_flags(profile: &RdpProfile) -> u32 {
     let mut flags = INFO_MOUSE
         | INFO_DISABLECTRLALTDEL
         | INFO_UNICODE
-        | INFO_MAXIMIZESHELL
         | INFO_LOGONNOTIFY
         | INFO_ENABLEWINDOWSKEY
         | INFO_LOGONERRORS;
+    // INFO_MAXIMIZESHELL only when an alternate shell is set (PSM/RemoteApp scenarios)
+    if profile.extra.contains_key("alternate shell")
+        || profile.extra.contains_key("alternate_shell")
+    {
+        flags |= INFO_MAXIMIZESHELL;
+    }
     if !profile.username.is_empty()
         && profile
             .password
@@ -1664,6 +1799,302 @@ fn wrap_mcs_send_data(user_id: u16, channel_id: u16, data: &[u8]) -> Vec<u8> {
     }
     mcs.extend_from_slice(data);
     wrap_tpkt_x224_data(&mcs)
+}
+
+fn parse_server_static_channel_id(data: &[u8], channel_index: usize) -> Option<u16> {
+    for offset in 0..data.len().saturating_sub(8) {
+        if u16::from_le_bytes([data[offset], data[offset + 1]]) != 0x0C03 {
+            continue;
+        }
+        let block_len = u16::from_le_bytes([data[offset + 2], data[offset + 3]]) as usize;
+        if block_len < 8 || offset + block_len > data.len() {
+            continue;
+        }
+        let channel_count = u16::from_le_bytes([data[offset + 6], data[offset + 7]]) as usize;
+        if channel_index >= channel_count || 8 + channel_count * 2 > block_len {
+            continue;
+        }
+        let channel_offset = offset + 8 + channel_index * 2;
+        return Some(u16::from_le_bytes([
+            data[channel_offset],
+            data[channel_offset + 1],
+        ]));
+    }
+    None
+}
+
+fn server_mcs_payload(data: &[u8]) -> Option<(u16, &[u8])> {
+    if data.len() < 14 || data[0] != 0x03 || data.get(5).copied() != Some(0xF0) {
+        return None;
+    }
+    let packet_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+    if packet_len > data.len() || data.get(7).copied() != Some(0x68) {
+        return None;
+    }
+
+    let channel_id = u16::from_be_bytes([data[10], data[11]]);
+    let mut offset = 13;
+    let first_len = *data.get(offset)?;
+    let payload_len = if first_len & 0x80 == 0 {
+        offset += 1;
+        first_len as usize
+    } else {
+        let second_len = *data.get(offset + 1)?;
+        offset += 2;
+        (((first_len & 0x7F) as usize) << 8) | second_len as usize
+    };
+    if offset + payload_len > packet_len {
+        return None;
+    }
+    Some((channel_id, &data[offset..offset + payload_len]))
+}
+
+fn server_mcs_channel_id(data: &[u8]) -> Option<u16> {
+    server_mcs_payload(data).map(|(channel_id, _)| channel_id)
+}
+
+#[derive(Default)]
+struct ClipboardProcessResult {
+    responses: Vec<Vec<u8>>,
+    remote_text: Option<String>,
+}
+
+fn process_cliprdr_packet(
+    packet: &[u8],
+    user_channel_id: u16,
+    cliprdr_channel_id: u16,
+    state: &mut ClipboardChannelState,
+) -> ClipboardProcessResult {
+    let mut result = ClipboardProcessResult::default();
+    let Some((_, payload)) = server_mcs_payload(packet) else {
+        return result;
+    };
+    if payload.len() < 8 {
+        return result;
+    }
+
+    let total_length =
+        u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    let channel_flags = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    if channel_flags & CHANNEL_FLAG_FIRST != 0 {
+        state.fragment_data.clear();
+        state.fragment_total_length = total_length;
+    }
+    state.fragment_data.extend_from_slice(&payload[8..]);
+    if channel_flags & CHANNEL_FLAG_LAST == 0 {
+        return result;
+    }
+
+    let expected = state.fragment_total_length.min(state.fragment_data.len());
+    let message = state.fragment_data[..expected].to_vec();
+    state.fragment_data.clear();
+    state.fragment_total_length = 0;
+    if message.len() < 8 {
+        return result;
+    }
+
+    let message_type = u16::from_le_bytes([message[0], message[1]]);
+    let message_flags = u16::from_le_bytes([message[2], message[3]]);
+    let data_length = u32::from_le_bytes([message[4], message[5], message[6], message[7]]) as usize;
+    if 8 + data_length > message.len() {
+        return result;
+    }
+    let data = &message[8..8 + data_length];
+    if state.debug {
+        rdp_log_line(format!(
+            "RDP DEBUG clipboard: type={} flags=0x{message_flags:04x} data={}B",
+            message_type,
+            data.len()
+        ));
+    }
+
+    match message_type {
+        CB_MONITOR_READY => {
+            result.responses.extend(build_cliprdr_capabilities(
+                user_channel_id,
+                cliprdr_channel_id,
+            ));
+            result.responses.extend(build_cliprdr_format_list(
+                user_channel_id,
+                cliprdr_channel_id,
+            ));
+        }
+        CB_FORMAT_LIST => {
+            result.responses.extend(build_cliprdr_message_pdus(
+                user_channel_id,
+                cliprdr_channel_id,
+                CB_FORMAT_LIST_RESPONSE,
+                CB_RESPONSE_OK,
+                &[],
+            ));
+            if let Some(format_id) = preferred_clipboard_format(data) {
+                state.pending_remote_format = Some(format_id);
+                result.responses.extend(build_cliprdr_message_pdus(
+                    user_channel_id,
+                    cliprdr_channel_id,
+                    CB_FORMAT_DATA_REQUEST,
+                    0,
+                    &format_id.to_le_bytes(),
+                ));
+            }
+        }
+        CB_FORMAT_DATA_REQUEST => {
+            if data.len() >= 4 {
+                let format_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                let response_data = encode_local_clipboard(&state.local_text, format_id);
+                let response_flag = if response_data.is_some() {
+                    CB_RESPONSE_OK
+                } else {
+                    CB_RESPONSE_FAIL
+                };
+                result.responses.extend(build_cliprdr_message_pdus(
+                    user_channel_id,
+                    cliprdr_channel_id,
+                    CB_FORMAT_DATA_RESPONSE,
+                    response_flag,
+                    response_data.as_deref().unwrap_or_default(),
+                ));
+            }
+        }
+        CB_FORMAT_DATA_RESPONSE if message_flags & CB_RESPONSE_OK != 0 => {
+            if let Some(format_id) = state.pending_remote_format.take() {
+                result.remote_text = decode_remote_clipboard(data, format_id);
+            }
+        }
+        CB_CLIP_CAPS | CB_FORMAT_LIST_RESPONSE | CB_FORMAT_DATA_RESPONSE => {}
+        _ => {}
+    }
+
+    result
+}
+
+fn preferred_clipboard_format(data: &[u8]) -> Option<u32> {
+    let mut offset = 0usize;
+    let mut fallback = None;
+    while offset + 4 <= data.len() {
+        let format_id = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]);
+        if format_id == CF_UNICODETEXT {
+            return Some(format_id);
+        }
+        if format_id == CF_TEXT {
+            fallback = Some(format_id);
+        }
+        offset += 4;
+
+        // Long format names are null-terminated UTF-16 strings. Empty names,
+        // which are standard for predefined clipboard formats, occupy 2 bytes.
+        while offset + 1 < data.len() {
+            let end = data[offset] == 0 && data[offset + 1] == 0;
+            offset += 2;
+            if end {
+                break;
+            }
+        }
+    }
+    fallback
+}
+
+fn encode_local_clipboard(text: &str, format_id: u32) -> Option<Vec<u8>> {
+    match format_id {
+        CF_UNICODETEXT => {
+            let mut encoded = Vec::with_capacity((text.len() + 1) * 2);
+            for code_unit in text.encode_utf16().chain(std::iter::once(0)) {
+                encoded.extend_from_slice(&code_unit.to_le_bytes());
+            }
+            Some(encoded)
+        }
+        CF_TEXT => {
+            let mut encoded = text.as_bytes().to_vec();
+            encoded.push(0);
+            Some(encoded)
+        }
+        _ => None,
+    }
+}
+
+fn decode_remote_clipboard(data: &[u8], format_id: u32) -> Option<String> {
+    match format_id {
+        CF_UNICODETEXT => {
+            let units = data
+                .chunks_exact(2)
+                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                .take_while(|unit| *unit != 0)
+                .collect::<Vec<_>>();
+            String::from_utf16(&units).ok()
+        }
+        CF_TEXT => Some(
+            String::from_utf8_lossy(data.split(|byte| *byte == 0).next().unwrap_or_default())
+                .into_owned(),
+        ),
+        _ => None,
+    }
+}
+
+fn build_cliprdr_capabilities(user_id: u16, channel_id: u16) -> Vec<Vec<u8>> {
+    let mut data = Vec::with_capacity(16);
+    data.extend_from_slice(&1u16.to_le_bytes()); // cCapabilitiesSets
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data.extend_from_slice(&1u16.to_le_bytes()); // CB_CAPSTYPE_GENERAL
+    data.extend_from_slice(&12u16.to_le_bytes());
+    data.extend_from_slice(&2u32.to_le_bytes()); // CB_CAPS_VERSION_2
+    data.extend_from_slice(&CB_USE_LONG_FORMAT_NAMES.to_le_bytes());
+    build_cliprdr_message_pdus(user_id, channel_id, CB_CLIP_CAPS, 0, &data)
+}
+
+fn build_cliprdr_format_list(user_id: u16, channel_id: u16) -> Vec<Vec<u8>> {
+    let mut data = Vec::with_capacity(6);
+    data.extend_from_slice(&CF_UNICODETEXT.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes()); // empty Unicode format name
+    build_cliprdr_message_pdus(user_id, channel_id, CB_FORMAT_LIST, 0, &data)
+}
+
+fn build_cliprdr_message_pdus(
+    user_id: u16,
+    channel_id: u16,
+    message_type: u16,
+    message_flags: u16,
+    data: &[u8],
+) -> Vec<Vec<u8>> {
+    let mut message = Vec::with_capacity(8 + data.len());
+    message.extend_from_slice(&message_type.to_le_bytes());
+    message.extend_from_slice(&message_flags.to_le_bytes());
+    message.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    message.extend_from_slice(data);
+
+    build_static_channel_message_pdus(user_id, channel_id, &message)
+}
+
+fn build_static_channel_message_pdus(
+    user_id: u16,
+    channel_id: u16,
+    message: &[u8],
+) -> Vec<Vec<u8>> {
+    let total_length = message.len() as u32;
+    let chunks = message.chunks(1600).collect::<Vec<_>>();
+    let chunk_count = chunks.len();
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            let mut flags = 0u32;
+            if index == 0 {
+                flags |= CHANNEL_FLAG_FIRST;
+            }
+            if index + 1 == chunk_count {
+                flags |= CHANNEL_FLAG_LAST;
+            }
+            let mut channel_data = Vec::with_capacity(8 + chunk.len());
+            channel_data.extend_from_slice(&total_length.to_le_bytes());
+            channel_data.extend_from_slice(&flags.to_le_bytes());
+            channel_data.extend_from_slice(chunk);
+            wrap_mcs_send_data(user_id, channel_id, &channel_data)
+        })
+        .collect()
 }
 
 /// Determine the total length of the next PDU in the buffer.
@@ -2204,6 +2635,31 @@ struct FastPathFragmentState {
     code: u8,
     data: Vec<u8>,
     active: bool,
+}
+
+const CLIPRDR_CHANNEL_NAME: &[u8; 8] = b"cliprdr\0";
+const RDPDR_CHANNEL_NAME: &[u8; 8] = b"rdpdr\0\0\0";
+const CHANNEL_FLAG_FIRST: u32 = 0x0000_0001;
+const CHANNEL_FLAG_LAST: u32 = 0x0000_0002;
+const CB_MONITOR_READY: u16 = 0x0001;
+const CB_FORMAT_LIST: u16 = 0x0002;
+const CB_FORMAT_LIST_RESPONSE: u16 = 0x0003;
+const CB_FORMAT_DATA_REQUEST: u16 = 0x0004;
+const CB_FORMAT_DATA_RESPONSE: u16 = 0x0005;
+const CB_CLIP_CAPS: u16 = 0x0007;
+const CB_RESPONSE_OK: u16 = 0x0001;
+const CB_RESPONSE_FAIL: u16 = 0x0002;
+const CB_USE_LONG_FORMAT_NAMES: u32 = 0x0000_0002;
+const CF_TEXT: u32 = 1;
+const CF_UNICODETEXT: u32 = 13;
+
+#[derive(Default)]
+struct ClipboardChannelState {
+    local_text: String,
+    fragment_data: Vec<u8>,
+    fragment_total_length: usize,
+    pending_remote_format: Option<u32>,
+    debug: bool,
 }
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
@@ -3355,6 +3811,70 @@ mod tests {
     }
 
     #[test]
+    fn client_network_data_requests_cliprdr_channel() {
+        let packet = build_mcs_connect_initial(&test_profile(Some("secret")), 1);
+        assert!(
+            packet
+                .windows(CLIPRDR_CHANNEL_NAME.len())
+                .any(|window| window == CLIPRDR_CHANNEL_NAME)
+        );
+    }
+
+    #[test]
+    fn client_network_data_requests_rdpdr_only_with_a_mapped_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut profile = test_profile(Some("secret"));
+        let without_drive = build_mcs_connect_initial(&profile, 1);
+        assert!(
+            !without_drive
+                .windows(RDPDR_CHANNEL_NAME.len())
+                .any(|window| window == RDPDR_CHANNEL_NAME)
+        );
+
+        profile.extra.insert(
+            "portix_drive_path".to_owned(),
+            temp.path().to_string_lossy().into_owned(),
+        );
+        let with_drive = build_mcs_connect_initial(&profile, 1);
+        assert!(
+            with_drive
+                .windows(RDPDR_CHANNEL_NAME.len())
+                .any(|window| window == RDPDR_CHANNEL_NAME)
+        );
+    }
+
+    #[test]
+    fn parses_server_static_virtual_channel_id() {
+        let mut response = vec![0xAA, 0xBB];
+        response.extend_from_slice(&0x0C03u16.to_le_bytes());
+        response.extend_from_slice(&10u16.to_le_bytes());
+        response.extend_from_slice(&1003u16.to_le_bytes());
+        response.extend_from_slice(&1u16.to_le_bytes());
+        response.extend_from_slice(&1005u16.to_le_bytes());
+        assert_eq!(parse_server_static_channel_id(&response, 0), Some(1005));
+    }
+
+    #[test]
+    fn clipboard_unicode_roundtrip_preserves_non_ascii_text() {
+        let source = "Portix clipboard: halo dunia";
+        let encoded = encode_local_clipboard(source, CF_UNICODETEXT).unwrap();
+        assert_eq!(
+            decode_remote_clipboard(&encoded, CF_UNICODETEXT).as_deref(),
+            Some(source)
+        );
+    }
+
+    #[test]
+    fn clipboard_prefers_unicode_format() {
+        let mut formats = Vec::new();
+        formats.extend_from_slice(&CF_TEXT.to_le_bytes());
+        formats.extend_from_slice(&0u16.to_le_bytes());
+        formats.extend_from_slice(&CF_UNICODETEXT.to_le_bytes());
+        formats.extend_from_slice(&0u16.to_le_bytes());
+        assert_eq!(preferred_clipboard_format(&formats), Some(CF_UNICODETEXT));
+    }
+
+    #[test]
     fn client_info_requests_autologon_only_with_a_password() {
         const INFO_AUTOLOGON: u32 = 0x0000_0008;
         const INFO_LOGONERRORS: u32 = 0x0001_0000;
@@ -3597,6 +4117,13 @@ mod tests {
             "2".to_owned(),
         );
         extra.insert("portix_auto_unlock".to_owned(), "1".to_owned());
+        if let Ok(path) = std::env::var("PORTIX_RDP_TEST_DRIVE_PATH") {
+            extra.insert("portix_drive_path".to_owned(), path);
+            extra.insert(
+                "portix_drive_name".to_owned(),
+                std::env::var("PORTIX_RDP_TEST_DRIVE_NAME").unwrap_or_else(|_| "PORTIX".to_owned()),
+            );
+        }
 
         let profile = RdpProfile {
             id: "rdp-live-test".to_owned(),
@@ -3613,12 +4140,14 @@ mod tests {
         };
 
         let (frame_tx, _frame_rx) = broadcast::channel::<RdpFrameEvent>(64);
+        let (clipboard_tx, mut clipboard_rx) = broadcast::channel::<RdpClipboardEvent>(16);
         let (status_tx, mut status_rx) = broadcast::channel::<ConnectionStatusEvent>(16);
         let (command_tx, command_rx) = mpsc::channel::<RdpCommand>(32);
         let runtime = RdpRuntime::new(
             profile,
             "rdp-live-test-session".to_owned(),
             frame_tx,
+            clipboard_tx,
             status_tx,
         );
         let handle = tokio::spawn(async move { runtime.run(command_rx).await });
@@ -3627,10 +4156,91 @@ mod tests {
         let mut snapshot = Vec::new();
         let mut last_status = None;
         let mut responsive_frame_requests = 0usize;
+        let clipboard_probe = std::env::var("PORTIX_RDP_TEST_CLIPBOARD").ok();
+        let mut remote_clipboard_text = None;
         // XRDP can spend about ten seconds reconnecting an existing desktop
         // while it waits for chansrv, so keep sampling past that transition.
-        for _ in 0..40 {
+        for sample in 0..40 {
             tokio::time::sleep(Duration::from_millis(500)).await;
+            if clipboard_probe.is_some() && sample == 24 {
+                let _ = command_tx
+                    .send(RdpCommand::SetClipboardText {
+                        text: clipboard_probe.clone().unwrap_or_default(),
+                    })
+                    .await;
+                for (scancode, is_pressed) in [
+                    (0x1D, true),
+                    (0x38, true),
+                    (0x14, true),
+                    (0x14, false),
+                    (0x38, false),
+                    (0x1D, false),
+                ] {
+                    let _ = command_tx
+                        .send(RdpCommand::KeyboardInput {
+                            scancode,
+                            is_pressed,
+                        })
+                        .await;
+                }
+            }
+            if clipboard_probe.is_some() && sample == 29 {
+                for (scancode, is_pressed) in [
+                    (0x1D, true),
+                    (0x2A, true),
+                    (0x2F, true),
+                    (0x2F, false),
+                    (0x2A, false),
+                    (0x1D, false),
+                ] {
+                    let _ = command_tx
+                        .send(RdpCommand::KeyboardInput {
+                            scancode,
+                            is_pressed,
+                        })
+                        .await;
+                }
+            }
+            if clipboard_probe.is_some() && sample == 32 {
+                for command in [
+                    RdpCommand::MouseMove { x: 76, y: 96 },
+                    RdpCommand::MouseInput {
+                        x: 76,
+                        y: 96,
+                        button: MouseButton::Left,
+                        is_pressed: true,
+                    },
+                    RdpCommand::MouseMove { x: 270, y: 96 },
+                    RdpCommand::MouseInput {
+                        x: 270,
+                        y: 96,
+                        button: MouseButton::Left,
+                        is_pressed: false,
+                    },
+                ] {
+                    let _ = command_tx.send(command).await;
+                }
+            }
+            if clipboard_probe.is_some() && sample == 33 {
+                for (scancode, is_pressed) in [
+                    (0x1D, true),
+                    (0x2A, true),
+                    (0x2E, true),
+                    (0x2E, false),
+                    (0x2A, false),
+                    (0x1D, false),
+                ] {
+                    let _ = command_tx
+                        .send(RdpCommand::KeyboardInput {
+                            scancode,
+                            is_pressed,
+                        })
+                        .await;
+                }
+            }
+            while let Ok(event) = clipboard_rx.try_recv() {
+                remote_clipboard_text = Some(event.text);
+            }
             while let Ok(status) = status_rx.try_recv() {
                 last_status = Some(format!("{:?}: {:?}", status.status, status.message));
             }
@@ -3690,6 +4300,13 @@ mod tests {
             changed_pixels > total_pixels / 20,
             "RDP framebuffer did not progress beyond the initial login view: changed_pixels={changed_pixels}/{total_pixels}"
         );
+        if let Some(probe) = clipboard_probe {
+            let copied = remote_clipboard_text.unwrap_or_default();
+            assert!(
+                copied.contains(&probe),
+                "remote clipboard did not return the selected probe: {copied:?}"
+            );
+        }
         let report = analyze_black_rows(&snapshot, width as usize, height as usize);
         eprintln!(
             "RDP LIVE FRAME REPORT changed_pixels={}/{} blackish_rows={} longest_run={} row_samples={:?}",

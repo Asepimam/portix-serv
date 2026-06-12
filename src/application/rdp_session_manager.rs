@@ -8,7 +8,9 @@ use crate::domain::errors::{PortixError, Result};
 use crate::domain::events::{ConnectionStatusEvent, ErrorEvent};
 use crate::domain::rdp_profile::RdpProfile;
 use crate::domain::session::ConnectionStatus;
-use crate::infrastructure::rdp_client::{MouseButton, RdpCommand, RdpFrameEvent, RdpRuntime};
+use crate::infrastructure::rdp_client::{
+    MouseButton, RdpClipboardEvent, RdpCommand, RdpFrameEvent, RdpRuntime,
+};
 
 /// Information about an active RDP session.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -27,6 +29,7 @@ struct ManagedRdpSession {
 pub struct RdpSessionManager {
     sessions: Arc<RwLock<HashMap<String, ManagedRdpSession>>>,
     frame_tx: broadcast::Sender<RdpFrameEvent>,
+    clipboard_tx: broadcast::Sender<RdpClipboardEvent>,
     status_tx: broadcast::Sender<ConnectionStatusEvent>,
     error_tx: broadcast::Sender<ErrorEvent>,
 }
@@ -34,11 +37,13 @@ pub struct RdpSessionManager {
 impl RdpSessionManager {
     pub fn new() -> Self {
         let (frame_tx, _) = broadcast::channel(16);
+        let (clipboard_tx, _) = broadcast::channel(64);
         let (status_tx, _) = broadcast::channel(256);
         let (error_tx, _) = broadcast::channel(256);
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             frame_tx,
+            clipboard_tx,
             status_tx,
             error_tx,
         }
@@ -50,6 +55,10 @@ impl RdpSessionManager {
 
     pub fn connection_status_stream(&self) -> broadcast::Receiver<ConnectionStatusEvent> {
         self.status_tx.subscribe()
+    }
+
+    pub fn clipboard_stream(&self) -> broadcast::Receiver<RdpClipboardEvent> {
+        self.clipboard_tx.subscribe()
     }
 
     pub fn error_event_stream(&self) -> broadcast::Receiver<ErrorEvent> {
@@ -85,12 +94,19 @@ impl RdpSessionManager {
 
         let sessions = self.sessions.clone();
         let frame_tx = self.frame_tx.clone();
+        let clipboard_tx = self.clipboard_tx.clone();
         let status_tx = self.status_tx.clone();
         let error_tx = self.error_tx.clone();
         let sid = session_id.clone();
 
         tokio::spawn(async move {
-            let runtime = RdpRuntime::new(profile, sid.clone(), frame_tx, status_tx.clone());
+            let runtime = RdpRuntime::new(
+                profile,
+                sid.clone(),
+                frame_tx,
+                clipboard_tx,
+                status_tx.clone(),
+            );
 
             let result = runtime.run(command_rx).await;
 
@@ -180,6 +196,16 @@ impl RdpSessionManager {
         session
             .command_tx
             .send(RdpCommand::MouseMove { x, y })
+            .await
+            .map_err(|_| PortixError::SessionNotFound(session_id))?;
+        Ok(())
+    }
+
+    pub async fn set_clipboard_text(&self, session_id: String, text: String) -> Result<()> {
+        let session = self.session(&session_id).await?;
+        session
+            .command_tx
+            .send(RdpCommand::SetClipboardText { text })
             .await
             .map_err(|_| PortixError::SessionNotFound(session_id))?;
         Ok(())
