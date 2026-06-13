@@ -23,7 +23,7 @@ async fn main() {
     let host = args
         .get(3)
         .cloned()
-        .unwrap_or_else(|| "host.example.com".to_owned());
+        .unwrap_or_else(|| "testhost-ip".to_owned());
     let width = args
         .get(4)
         .and_then(|value| value.parse::<u16>().ok())

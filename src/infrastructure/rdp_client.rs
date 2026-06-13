@@ -1694,10 +1694,21 @@ fn build_client_info_pdu(user_channel_id: u16, profile: &RdpProfile) -> Vec<u8> 
         .flat_map(|c| c.to_le_bytes())
         .collect();
 
+    let alt_shell = profile
+        .extra
+        .get("alternate shell")
+        .or_else(|| profile.extra.get("alternate_shell"))
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let alt_shell_utf16: Vec<u8> = alt_shell
+        .encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
+
     info.extend_from_slice(&(domain_utf16.len() as u16).to_le_bytes());
     info.extend_from_slice(&(username_utf16.len() as u16).to_le_bytes());
     info.extend_from_slice(&(password_utf16.len() as u16).to_le_bytes());
-    info.extend_from_slice(&0u16.to_le_bytes()); // AlternateShell length
+    info.extend_from_slice(&(alt_shell_utf16.len() as u16).to_le_bytes()); // AlternateShell length
     info.extend_from_slice(&0u16.to_le_bytes()); // WorkingDir length
 
     info.extend_from_slice(&domain_utf16);
@@ -1706,13 +1717,14 @@ fn build_client_info_pdu(user_channel_id: u16, profile: &RdpProfile) -> Vec<u8> 
     info.extend_from_slice(&[0, 0]);
     info.extend_from_slice(&password_utf16);
     info.extend_from_slice(&[0, 0]);
+    info.extend_from_slice(&alt_shell_utf16);
     info.extend_from_slice(&[0, 0]); // AlternateShell null
     info.extend_from_slice(&[0, 0]); // WorkingDir null
 
     // TS_EXTENDED_INFO_PACKET (required by xrdp 0.10+)
     info.extend_from_slice(&2u16.to_le_bytes()); // clientAddressFamily: AF_INET
     // cbClientAddress (including null terminator, in bytes)
-    let client_addr = "127.0.0.1";
+    let client_addr = "localhost";
     let addr_utf16: Vec<u8> = client_addr
         .encode_utf16()
         .flat_map(|c| c.to_le_bytes())
@@ -1752,10 +1764,15 @@ fn client_info_flags(profile: &RdpProfile) -> u32 {
     let mut flags = INFO_MOUSE
         | INFO_DISABLECTRLALTDEL
         | INFO_UNICODE
-        | INFO_MAXIMIZESHELL
         | INFO_LOGONNOTIFY
         | INFO_ENABLEWINDOWSKEY
         | INFO_LOGONERRORS;
+    // INFO_MAXIMIZESHELL only when an alternate shell is set (PSM/RemoteApp scenarios)
+    if profile.extra.contains_key("alternate shell")
+        || profile.extra.contains_key("alternate_shell")
+    {
+        flags |= INFO_MAXIMIZESHELL;
+    }
     if !profile.username.is_empty()
         && profile
             .password
@@ -3743,7 +3760,7 @@ mod tests {
         RdpProfile {
             id: "test-profile".to_owned(),
             name: "Test profile".to_owned(),
-            host: "host.example.com".to_owned(),
+            host: "testhost".to_owned(),
             port: 3389,
             username: "testuser".to_owned(),
             password: password.map(str::to_owned),
@@ -3889,13 +3906,13 @@ mod tests {
         let default_policy = AutoUnlockPolicy::from_profile(&test_profile(Some("secret")));
         assert!(!default_policy.enabled);
 
-        let mut enabled = test_profile(Some("test-password"));
+        let mut enabled = test_profile(Some("test"));
         enabled
             .extra
             .insert("portix_auto_unlock".to_owned(), "1".to_owned());
         assert!(AutoUnlockPolicy::from_profile(&enabled).enabled);
-        assert!(build_text_input_pdus(1004, "test-password", true).is_some());
         assert!(build_text_input_pdus(1004, "test", true).is_some());
+        assert!(build_text_input_pdus(1004, "password-123", true).is_some());
         assert!(build_text_input_pdus(1004, "sandi🔒", true).is_none());
     }
 
@@ -4078,11 +4095,11 @@ mod tests {
     #[ignore = "requires reachable xrdp server; run with cargo test rdp_live_frame_diagnostic -- --ignored --nocapture"]
     async fn rdp_live_frame_diagnostic() {
         let host =
-            std::env::var("PORTIX_RDP_TEST_HOST").unwrap_or_else(|_| "test-host-ip".to_owned());
+            std::env::var("PORTIX_RDP_TEST_HOST").unwrap_or_else(|_| "testhost-ip".to_owned());
         let username =
-            std::env::var("PORTIX_RDP_TEST_USER").unwrap_or_else(|_| "test-user".to_owned());
-        let password = std::env::var("PORTIX_RDP_TEST_PASSWORD")
-            .unwrap_or_else(|_| "test-password".to_owned());
+            std::env::var("PORTIX_RDP_TEST_USER").unwrap_or_else(|_| "testuser".to_owned());
+        let password =
+            std::env::var("PORTIX_RDP_TEST_PASSWORD").unwrap_or_else(|_| "testpassword".to_owned());
         let width = std::env::var("PORTIX_RDP_TEST_WIDTH")
             .ok()
             .and_then(|value| value.parse::<u16>().ok())

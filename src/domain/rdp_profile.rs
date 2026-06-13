@@ -80,7 +80,7 @@ impl RdpProfile {
             .cloned()
             .unwrap_or_default();
 
-        let (host, port) = parse_address(&full_address);
+        let (host, addr_port) = parse_address(&full_address);
 
         if host.is_empty() {
             return Err(PortixError::InvalidProfile(
@@ -88,9 +88,22 @@ impl RdpProfile {
             ));
         }
 
-        let username = settings.get("username").cloned().unwrap_or_default();
+        // "port:i:N" overrides port embedded in full address
+        let port = settings
+            .get("port")
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(addr_port);
 
-        let domain = settings.get("domain").cloned().filter(|d| !d.is_empty());
+        // Parse "domain\username" or plain username; domain field is fallback
+        let raw_username = settings.get("username").cloned().unwrap_or_default();
+        let (username, domain) = if let Some(pos) = raw_username.find('\\') {
+            let d = raw_username[..pos].to_owned();
+            let u = raw_username[pos + 1..].to_owned();
+            (u, if d.is_empty() { None } else { Some(d) })
+        } else {
+            let d = settings.get("domain").cloned().filter(|d| !d.is_empty());
+            (raw_username, d)
+        };
 
         let width = settings
             .get("desktopwidth")
@@ -111,6 +124,7 @@ impl RdpProfile {
         let known_keys = [
             "full address",
             "full_address",
+            "port",
             "username",
             "domain",
             "desktopwidth",
@@ -266,7 +280,7 @@ screen mode id:i:2
     #[test]
     fn to_rdp_file_roundtrip() {
         let content = r#"full address:s:server.local:3390
-username:s:admin
+username:s:testuser
 desktopwidth:i:1280
 desktopheight:i:720
 screen mode id:i:1
@@ -274,6 +288,6 @@ screen mode id:i:1
         let profile = RdpProfile::from_rdp_file("rt".into(), "Roundtrip".into(), content).unwrap();
         let output = profile.to_rdp_file_content();
         assert!(output.contains("full address:s:server.local:3390"));
-        assert!(output.contains("username:s:admin"));
+        assert!(output.contains("username:s:testuser"));
     }
 }
