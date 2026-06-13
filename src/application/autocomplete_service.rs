@@ -107,14 +107,18 @@ impl AutocompleteService {
         let final_suggestion = if suggestion.is_some() {
             suggestion
         } else if should_complete_option(&context) {
-            context.command.as_deref().and_then(|cmd| {
-                OptionProvider::inline_suggestion(cmd, &context.current_token)
-            })
+            context
+                .command
+                .as_deref()
+                .and_then(|cmd| OptionProvider::inline_suggestion(cmd, &context.current_token))
         } else {
             None
         };
 
-        Ok(TerminalCompleteResponse { suggestion: final_suggestion, items })
+        Ok(TerminalCompleteResponse {
+            suggestion: final_suggestion,
+            items,
+        })
     }
 }
 
@@ -144,13 +148,54 @@ fn should_complete_option(context: &crate::domain::autocomplete::CompletionConte
         if let Some(cmd) = context.command.as_deref() {
             return matches!(
                 cmd,
-                "ls" | "grep" | "rg" | "find" | "chmod" | "chown" | "cp" | "mv" | "rm"
-                    | "mkdir" | "cat" | "tail" | "head" | "less" | "tar" | "zip" | "gzip"
-                    | "curl" | "wget" | "ssh" | "scp" | "rsync" | "ps" | "kill"
-                    | "pgrep" | "pkill" | "du" | "df" | "awk" | "sed" | "jq"
-                    | "xargs" | "sort" | "uniq" | "wc" | "cut" | "watch"
-                    | "ss" | "lsof" | "ip" | "ping" | "dig" | "openssl" | "ufw"
-                    | "nginx" | "make" | "psql" | "mysql" | "crontab"
+                "ls" | "grep"
+                    | "rg"
+                    | "find"
+                    | "chmod"
+                    | "chown"
+                    | "cp"
+                    | "mv"
+                    | "rm"
+                    | "mkdir"
+                    | "cat"
+                    | "tail"
+                    | "head"
+                    | "less"
+                    | "tar"
+                    | "zip"
+                    | "gzip"
+                    | "curl"
+                    | "wget"
+                    | "ssh"
+                    | "scp"
+                    | "rsync"
+                    | "ps"
+                    | "kill"
+                    | "pgrep"
+                    | "pkill"
+                    | "du"
+                    | "df"
+                    | "awk"
+                    | "sed"
+                    | "jq"
+                    | "xargs"
+                    | "sort"
+                    | "uniq"
+                    | "wc"
+                    | "cut"
+                    | "watch"
+                    | "ss"
+                    | "lsof"
+                    | "ip"
+                    | "ping"
+                    | "dig"
+                    | "openssl"
+                    | "ufw"
+                    | "nginx"
+                    | "make"
+                    | "psql"
+                    | "mysql"
+                    | "crontab"
             );
         }
     }
@@ -165,16 +210,40 @@ fn should_complete_subcommand(context: &crate::domain::autocomplete::CompletionC
     if context.token_index == 0 {
         return false;
     }
-    if token.starts_with('-') || token.starts_with('.') || token.starts_with('/')
-        || token.starts_with('~') || token.contains('/') || token.starts_with('$') {
+    if token.starts_with('-')
+        || token.starts_with('.')
+        || token.starts_with('/')
+        || token.starts_with('~')
+        || token.contains('/')
+        || token.starts_with('$')
+    {
         return false;
     }
     matches!(
         context.command.as_deref(),
-        Some("docker" | "docker compose" | "systemctl" | "journalctl" | "kubectl"
-            | "apt" | "apt-get" | "yum" | "dnf" | "npm" | "cargo" | "pip" | "pip3"
-            | "git" | "python" | "python3" | "redis-cli" | "tmux" | "make"
-            | "openssl" | "ufw")
+        Some(
+            "docker"
+                | "docker compose"
+                | "systemctl"
+                | "journalctl"
+                | "kubectl"
+                | "apt"
+                | "apt-get"
+                | "yum"
+                | "dnf"
+                | "npm"
+                | "cargo"
+                | "pip"
+                | "pip3"
+                | "git"
+                | "python"
+                | "python3"
+                | "redis-cli"
+                | "tmux"
+                | "make"
+                | "openssl"
+                | "ufw"
+        )
     )
 }
 

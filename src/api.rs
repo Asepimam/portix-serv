@@ -4,15 +4,18 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 
 use crate::application::autocomplete_service::AutocompleteService;
+use crate::application::rdp_session_manager::{RdpSessionInfo, RdpSessionManager};
 use crate::application::session_manager::SessionManager;
 use crate::domain::autocomplete::TerminalCompleteRequest;
 use crate::domain::errors::PortixError;
 use crate::domain::profile::SshProfile;
+use crate::domain::rdp_profile::RdpProfile;
 use crate::domain::session::{RemoteFileEntry, RemoteSystemSnapshot, SessionInfo};
 use crate::frb_generated::StreamSink;
 
 static SESSION_MANAGER: Lazy<SessionManager> = Lazy::new(SessionManager::new);
 static AUTOCOMPLETE_SERVICE: Lazy<AutocompleteService> = Lazy::new(AutocompleteService::new);
+static RDP_SESSION_MANAGER: Lazy<RdpSessionManager> = Lazy::new(RdpSessionManager::new);
 
 #[frb(init)]
 pub fn init_app() {
@@ -201,4 +204,101 @@ where
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
+}
+
+// ─── RDP API ────────────────────────────────────────────────────────────────
+
+/// Parse an .rdp file content and return an RdpProfile.
+pub fn parse_rdp_file(id: String, name: String, content: String) -> anyhow::Result<RdpProfile> {
+    Ok(RdpProfile::from_rdp_file(id, name, &content)?)
+}
+
+/// Connect to an RDP server using the given profile.
+pub async fn rdp_connect(profile: RdpProfile) -> anyhow::Result<RdpSessionInfo> {
+    Ok(RDP_SESSION_MANAGER.connect(profile).await?)
+}
+
+/// Disconnect an active RDP session.
+pub async fn rdp_disconnect(session_id: String) -> anyhow::Result<()> {
+    Ok(RDP_SESSION_MANAGER.disconnect(session_id).await?)
+}
+
+/// Send keyboard input to an RDP session.
+pub async fn rdp_send_keyboard(
+    session_id: String,
+    scancode: u16,
+    is_pressed: bool,
+) -> anyhow::Result<()> {
+    Ok(RDP_SESSION_MANAGER
+        .send_keyboard_input(session_id, scancode, is_pressed)
+        .await?)
+}
+
+/// Send mouse button input to an RDP session.
+/// button: 0 = left, 1 = right, 2 = middle
+pub async fn rdp_send_mouse_button(
+    session_id: String,
+    x: u16,
+    y: u16,
+    button: u8,
+    is_pressed: bool,
+) -> anyhow::Result<()> {
+    Ok(RDP_SESSION_MANAGER
+        .send_mouse_input(session_id, x, y, button, is_pressed)
+        .await?)
+}
+
+/// Send mouse move event to an RDP session.
+pub async fn rdp_send_mouse_move(session_id: String, x: u16, y: u16) -> anyhow::Result<()> {
+    Ok(RDP_SESSION_MANAGER
+        .send_mouse_move(session_id, x, y)
+        .await?)
+}
+
+/// Publish local Unicode clipboard text to an RDP session.
+pub async fn rdp_set_clipboard_text(session_id: String, text: String) -> anyhow::Result<()> {
+    Ok(RDP_SESSION_MANAGER
+        .set_clipboard_text(session_id, text)
+        .await?)
+}
+
+/// Request the current frame buffer as raw RGBA bytes.
+pub async fn rdp_request_frame(session_id: String) -> anyhow::Result<Vec<u8>> {
+    Ok(RDP_SESSION_MANAGER.request_frame(session_id).await?)
+}
+
+/// Stream RDP frame updates (region updates as JSON).
+pub async fn rdp_frame_stream(sink: StreamSink<String>) -> anyhow::Result<()> {
+    let mut rx = RDP_SESSION_MANAGER.frame_stream();
+    tokio::spawn(async move {
+        forward_json_stream(&mut rx, sink).await;
+    });
+    Ok(())
+}
+
+/// Stream Unicode clipboard text copied inside active RDP sessions.
+pub async fn rdp_clipboard_stream(sink: StreamSink<String>) -> anyhow::Result<()> {
+    let mut rx = RDP_SESSION_MANAGER.clipboard_stream();
+    tokio::spawn(async move {
+        forward_json_stream(&mut rx, sink).await;
+    });
+    Ok(())
+}
+
+/// Stream RDP connection status events.
+pub async fn rdp_connection_status_stream(sink: StreamSink<String>) -> anyhow::Result<()> {
+    let mut rx = RDP_SESSION_MANAGER.connection_status_stream();
+    tokio::spawn(async move {
+        forward_json_stream(&mut rx, sink).await;
+    });
+    Ok(())
+}
+
+/// Stream RDP error events.
+pub async fn rdp_error_event_stream(sink: StreamSink<String>) -> anyhow::Result<()> {
+    let mut rx = RDP_SESSION_MANAGER.error_event_stream();
+    tokio::spawn(async move {
+        forward_json_stream(&mut rx, sink).await;
+    });
+    Ok(())
 }
