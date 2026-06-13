@@ -1,11 +1,3 @@
-//! Quick RDP framebuffer diagnostic against an xrdp/RDP server.
-//!
-//! Usage:
-//!   cargo run --example rdp_test -- <username> <password> [host] [width] [height]
-//!
-//! The test requests the same full framebuffer snapshot used by Flutter when
-//! `portix_stream_pixels=0`, then reports likely horizontal black-bar artifacts.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
