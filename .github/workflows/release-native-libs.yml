@@ -66,7 +66,7 @@ jobs:
           Copy-Item "target/release-hardened/${{ matrix.lib_name }}" "dist/${{ matrix.asset_name }}"
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset_name }}
           path: dist/${{ matrix.asset_name }}
@@ -134,7 +134,7 @@ jobs:
           tar -czf libportix_serv_android_${{ matrix.abi }}.tar.gz -C dist ${{ matrix.artifact_dir }}
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: libportix_serv_android_${{ matrix.abi }}
           path: libportix_serv_android_${{ matrix.abi }}.tar.gz
@@ -181,7 +181,7 @@ jobs:
           tar -czf libportix_serv_ios.tar.gz -C dist ios
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: libportix_serv_ios
           path: libportix_serv_ios.tar.gz
