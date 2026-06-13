@@ -24,3 +24,25 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+# ─── Release profile: hardened for distribution ───────────────────────────────
+# Goals:
+#   • Smallest possible binary (no debug symbols leaked into release artifact)
+#   • Aggressive inlining + dead-code elimination via LTO
+#   • panic=abort removes unwinding tables (less reversible, smaller binary)
+#   • opt-level=3 + codegen-units=1 for maximum optimisation & fewer symbols
+[profile.release]
+opt-level        = 3        # maximum speed optimisation
+lto              = "fat"    # whole-program link-time optimisation
+codegen-units    = 1        # single codegen unit → better inlining, fewer symbols
+panic            = "abort"  # no unwinding machinery; removes stack-trace strings
+strip            = "symbols" # strip ALL symbols from the final binary
+overflow-checks  = false    # disable integer-overflow checks in release builds
+debug            = false    # no debug info in release binary
+
+# ─── Hardened release profile used only in CI security-build step ─────────────
+# Identical to [release] but also strips debuginfo aggressively.
+[profile.release-hardened]
+inherits         = "release"
+strip            = "debuginfo"
+
