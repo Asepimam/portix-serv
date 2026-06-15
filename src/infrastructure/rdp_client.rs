@@ -829,14 +829,19 @@ impl RdpRuntime {
                 .enabled()
                 .then(|| parse_server_static_channel_id(&buf[..n], 1))
                 .flatten();
+            // Parse encryption level from SC_SECURITY block.
+            // encryptionLevel=0 means no RDP security layer — Client Info PDU
+            // must NOT include the SEC_INFO_PKT security header in that case.
+            let server_encryption_level = parse_server_encryption_level(&buf[..n]);
             debug_stats.log_connect(format!(
-                "cliprdr_channel_id={} rdpdr_channel_id={}",
+                "cliprdr_channel_id={} rdpdr_channel_id={} encryption_level={}",
                 cliprdr_channel_id
                     .map(|channel| channel.to_string())
                     .unwrap_or_else(|| "unavailable".to_owned()),
                 rdpdr_channel_id
                     .map(|channel| channel.to_string())
                     .unwrap_or_else(|| "unavailable".to_owned()),
+                server_encryption_level,
             ));
 
             // ─── MCS Erect Domain + Attach User ──────────────────────────────
@@ -869,25 +874,26 @@ impl RdpRuntime {
             }
 
             // ─── Client Info PDU ──────────────────────────────────────────────
-            let client_info = build_client_info_pdu(user_channel_id, &self.profile);
+            let client_info = build_client_info_pdu(user_channel_id, &self.profile, server_encryption_level);
             tls_stream.write_all(&client_info).await?;
 
-            // ─── Wait for Demand Active PDU ───────────────────────────────────
-            let mut got_demand_active = false;
-            for _ in 0..30 {
-                let n = tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    tls_stream.read(&mut buf),
-                )
-                .await??;
-                if n == 0 {
-                    break;
-                }
-                if contains_demand_active(&buf[..n]) {
-                    got_demand_active = true;
-                    break;
-                }
-            }
+            // ─── Licensing + Wait for Demand Active PDU ───────────────────────
+            // After Client Info PDU the server sends one of:
+            //   1. A licensing PDU sequence (Server License Request → Platform
+            //      Challenge → optionally New License / Upgrade License / No
+            //      License Required), followed by the Demand Active PDU.
+            //   2. The Demand Active PDU directly (xrdp no-license mode).
+            //
+            // We handle the licensing exchange here so the Demand Active never
+            // gets swallowed by an unprocessed licensing packet.
+            let got_demand_active = wait_for_demand_active(
+                &mut tls_stream,
+                &mut buf,
+                user_channel_id,
+                &debug_stats,
+            )
+            .await?;
+
             if !got_demand_active {
                 return Err(anyhow::anyhow!(
                     "Failed to receive Demand Active PDU. \
@@ -1425,9 +1431,13 @@ fn parse_x224_confirm(data: &[u8]) -> anyhow::Result<u8> {
             if neg_start < data.len() && data[neg_start] == 0x02 {
                 // TYPE_RDP_NEG_RSP
                 let selected_protocol = data[neg_start + 4];
+                // NLA/CredSSP (0x02) or RDSTLS (0x08): we don't implement
+                // CredSSP. Return a clear, actionable error.
                 if selected_protocol == 0x02 || selected_protocol == 0x08 {
                     return Err(anyhow::anyhow!(
-                        "RDP server selected NLA/CredSSP, which Portix RDP does not support yet. Disable NLA on the server or use TLS security."
+                        "RDP server requires NLA/CredSSP authentication, which is not \
+                         supported. Disable NLA on the server, or in xrdp.ini set \
+                         security_layer=tls under [Globals]."
                     ));
                 }
                 return Ok(selected_protocol);
@@ -1438,9 +1448,10 @@ fn parse_x224_confirm(data: &[u8]) -> anyhow::Result<u8> {
     }
 
     // Some servers (like xrdp without proper config) send 0xF0 (Data TPDU)
-    // or other unexpected responses — treat as negotiation failure
+    // or other unexpected responses — treat as negotiation failure so the
+    // caller can retry with a plain (no-negotiation) X.224 CR.
     Err(anyhow::anyhow!(
-        "Expected X.224 CC (0xD0), got 0x{:02X}. Server may require TLS configuration.",
+        "X.224 negotiation failed (got 0x{:02X}). Retrying without TLS negotiation.",
         x224_type
     ))
 }
@@ -1670,10 +1681,15 @@ fn build_mcs_channel_join(user_id: u16, channel_id: u16) -> Vec<u8> {
     wrap_tpkt_x224_data(&d)
 }
 
-fn build_client_info_pdu(user_channel_id: u16, profile: &RdpProfile) -> Vec<u8> {
+fn build_client_info_pdu(user_channel_id: u16, profile: &RdpProfile, encryption_level: u32) -> Vec<u8> {
     let mut info = Vec::new();
-    // Security header: SEC_INFO_PKT
-    info.extend_from_slice(&0x00000040u32.to_le_bytes());
+    // Security header: only include SEC_INFO_PKT (0x40) when encryption is active.
+    // With security_layer=tls and encryptionLevel=0, the security header must be
+    // omitted — xrdp will disconnect with MCS Disconnect Provider Ultimatum if
+    // it receives an unexpected security header in no-encryption mode.
+    if encryption_level > 0 {
+        info.extend_from_slice(&0x00000040u32.to_le_bytes()); // SEC_INFO_PKT
+    }
     // TS_INFO_PACKET
     info.extend_from_slice(&0u32.to_le_bytes()); // CodePage
     info.extend_from_slice(&client_info_flags(profile).to_le_bytes());
@@ -1799,6 +1815,34 @@ fn wrap_mcs_send_data(user_id: u16, channel_id: u16, data: &[u8]) -> Vec<u8> {
     }
     mcs.extend_from_slice(data);
     wrap_tpkt_x224_data(&mcs)
+}
+
+/// Parse the encryptionLevel from the SC_SECURITY (0x0C02) block inside the
+/// MCS Connect Response GCC user data.
+///
+/// Returns 0 if no SC_SECURITY block is found or encryption is disabled.
+/// A non-zero value means RDP security layer is active and the Client Info
+/// PDU must carry the SEC_INFO_PKT (0x40) security header.
+fn parse_server_encryption_level(data: &[u8]) -> u32 {
+    // SC_SECURITY block: type=0x0C02 (LE) | length(2) | encryptionMethod(4) | encryptionLevel(4)
+    for offset in 0..data.len().saturating_sub(12) {
+        if u16::from_le_bytes([data[offset], data[offset + 1]]) != 0x0C02 {
+            continue;
+        }
+        let block_len = u16::from_le_bytes([data[offset + 2], data[offset + 3]]) as usize;
+        if block_len < 12 || offset + block_len > data.len() {
+            continue;
+        }
+        // encryptionLevel is at offset+8 (after type + length + encryptionMethod)
+        return u32::from_le_bytes([
+            data[offset + 8],
+            data[offset + 9],
+            data[offset + 10],
+            data[offset + 11],
+        ]);
+    }
+    // No SC_SECURITY found — default to 0 (no encryption, no security header needed)
+    0
 }
 
 fn parse_server_static_channel_id(data: &[u8], channel_index: usize) -> Option<u16> {
@@ -2140,6 +2184,257 @@ fn get_pdu_length(buf: &[u8]) -> Option<usize> {
             Some(len)
         }
     }
+}
+
+// ─── Licensing Exchange ───────────────────────────────────────────────────────
+//
+// MS-RDPBCGR §5.4.4 specifies that after the Client Info PDU the server MUST
+// send a licensing PDU before the Demand Active PDU.  xrdp in "no-license"
+// mode sends a Server License Error PDU (STATUS_VALID_CLIENT / 0xFF03) which
+// acts as "no license required".  Full Windows servers send a longer exchange.
+//
+// Security header byte at offset 12 of the inner payload identifies the PDU:
+//   0x0080 = SEC_LICENSE_PKT
+//
+// bMsgType inside the license packet:
+//   0x01 = LICENSE_REQUEST           (server → client, needs reply)
+//   0x12 = PLATFORM_CHALLENGE        (server → client, needs reply)
+//   0x03 = NEW_LICENSE               (server → client, terminal)
+//   0x04 = UPGRADE_LICENSE           (server → client, terminal)
+//   0xFF = ERROR_ALERT               (server → client, may be terminal)
+//
+// We respond to LICENSE_REQUEST with a Client New License Request and to
+// PLATFORM_CHALLENGE with a Client Platform Challenge Response so that both
+// xrdp and Windows accept us without requiring NLA.
+
+const SEC_LICENSE_PKT: u16 = 0x0080;
+const LICENSE_REQUEST: u8 = 0x01;
+const PLATFORM_CHALLENGE: u8 = 0x12;
+const NEW_LICENSE: u8 = 0x03;
+const UPGRADE_LICENSE: u8 = 0x04;
+const LICENSE_ERROR_ALERT: u8 = 0xFF;
+
+/// Extract the security header flags and licensing payload from a TPKT/MCS
+/// packet. Returns `(sec_flags, license_payload)` if the structure looks like
+/// a licensing PDU, otherwise `None`.
+fn extract_license_payload(data: &[u8]) -> Option<(u16, &[u8])> {
+    // Minimum: TPKT(4) + X224(3) + MCS SendDataIndication(7) + sec_hdr(4)
+    if data.len() < 18 || data[0] != 0x03 {
+        return None;
+    }
+    let tpkt_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+    if tpkt_len > data.len() || data.get(5).copied() != Some(0xF0) {
+        return None;
+    }
+    // MCS SendDataIndication tag = 0x68
+    if data.get(7).copied() != Some(0x68) {
+        return None;
+    }
+    // Skip: MCS tag(1) + initiator(2) + channelId(2) + dataPriority(1) = 6 bytes past offset 7
+    let mut offset = 13;
+    // MCS length field (1 or 2 bytes)
+    let len_byte = *data.get(offset)?;
+    offset += if len_byte & 0x80 != 0 { 2 } else { 1 };
+
+    // Security header: 4 bytes (flags u16 LE + flagsHi u16 LE)
+    if offset + 4 > data.len() {
+        return None;
+    }
+    let sec_flags = u16::from_le_bytes([data[offset], data[offset + 1]]);
+    offset += 4;
+
+    if sec_flags & SEC_LICENSE_PKT == 0 {
+        return None;
+    }
+
+    Some((sec_flags, &data[offset..tpkt_len.min(data.len())]))
+}
+
+/// Returns the bMsgType from a license PDU payload (first byte after the
+/// security header), or `None` if the payload is too short.
+fn license_msg_type(payload: &[u8]) -> Option<u8> {
+    payload.first().copied()
+}
+
+/// Build a minimal Client New License Request (LICENSE_REQUEST response).
+/// We send a null/empty request which is sufficient for xrdp and causes full
+/// Windows to proceed to the PLATFORM_CHALLENGE step.
+fn build_client_new_license_request(user_channel_id: u16) -> Vec<u8> {
+    // TS_LICENSE_PDU: bMsgType(1) + flags(1) + wMsgSize(2) + ClientRandom(32)
+    // + PreMasterSecret length(4=0) + EncryptedPreMasterSecret length(4=0)
+    // + ClientUserName cbbString(4) + ClientMachineName cbbString(4)
+    let mut lic = Vec::new();
+    lic.push(0x13); // bMsgType = CLIENT_NEW_LICENSE_REQUEST
+    lic.push(0x00); // flags
+    // wMsgSize: we fill this in after
+    let size_offset = lic.len();
+    lic.extend_from_slice(&0u16.to_le_bytes()); // placeholder
+    // ClientRandom (32 bytes of zeros — acceptable for null license exchange)
+    lic.extend_from_slice(&[0u8; 32]);
+    // ConnectFlags (4 bytes)
+    lic.extend_from_slice(&0u32.to_le_bytes());
+    // EncryptedPreMasterSecret: length (4) + data (0)
+    lic.extend_from_slice(&0u32.to_le_bytes());
+    // LicensingBlobType (2) + cbEncryptedBlob (2) + blob (0)
+    lic.extend_from_slice(&0u16.to_le_bytes()); // LicensingBlobType
+    lic.extend_from_slice(&0u16.to_le_bytes()); // cbEncryptedBlob
+    // ClientUserName: cbString(2) + string
+    let username = b"portix\0";
+    lic.extend_from_slice(&(username.len() as u16).to_le_bytes());
+    lic.extend_from_slice(username);
+    // ClientMachineName: cbString(2) + string
+    let machine = b"PORTIX\0";
+    lic.extend_from_slice(&(machine.len() as u16).to_le_bytes());
+    lic.extend_from_slice(machine);
+
+    // Patch wMsgSize
+    let msg_size = lic.len() as u16;
+    lic[size_offset..size_offset + 2].copy_from_slice(&msg_size.to_le_bytes());
+
+    // Wrap in security header (SEC_LICENSE_PKT = 0x0080) + MCS + TPKT
+    build_license_pdu(user_channel_id, &lic)
+}
+
+/// Build a Client Platform Challenge Response.  The actual cryptography is
+/// skipped (zeros) which is fine for xrdp and causes Windows to respond with
+/// a NEW_LICENSE or ERROR_ALERT that we then treat as "licensing done".
+fn build_client_platform_challenge_response(user_channel_id: u16) -> Vec<u8> {
+    let mut lic = Vec::new();
+    lic.push(0x15); // bMsgType = CLIENT_PLATFORM_CHALLENGE_RESPONSE
+    lic.push(0x00); // flags
+    let size_offset = lic.len();
+    lic.extend_from_slice(&0u16.to_le_bytes()); // wMsgSize placeholder
+    // EncryptedPlatformChallengeResponse blob (type 0, len 0)
+    lic.extend_from_slice(&0u16.to_le_bytes()); // BlobType
+    lic.extend_from_slice(&0u16.to_le_bytes()); // cbEncryptedBlob
+    // EncryptedHWID blob (type 0, len 0)
+    lic.extend_from_slice(&0u16.to_le_bytes());
+    lic.extend_from_slice(&0u16.to_le_bytes());
+    // MACData (16 zeros)
+    lic.extend_from_slice(&[0u8; 16]);
+
+    let msg_size = lic.len() as u16;
+    lic[size_offset..size_offset + 2].copy_from_slice(&msg_size.to_le_bytes());
+
+    build_license_pdu(user_channel_id, &lic)
+}
+
+/// Wrap a raw license PDU body in SEC_LICENSE_PKT + MCS SendDataRequest + TPKT.
+fn build_license_pdu(user_channel_id: u16, body: &[u8]) -> Vec<u8> {
+    // Security header: SEC_LICENSE_PKT(0x0080) + flagsHi(0x0000)
+    let mut payload = Vec::with_capacity(4 + body.len());
+    payload.extend_from_slice(&0x0080u16.to_le_bytes()); // secFlags
+    payload.extend_from_slice(&0x0000u16.to_le_bytes()); // secFlagsHi
+    payload.extend_from_slice(body);
+    wrap_mcs_send_data(user_channel_id, 1003, &payload)
+}
+
+/// Check whether a licensing ERROR_ALERT represents a terminal "no license
+/// required" / "valid client" status (i.e. we can proceed to Demand Active).
+fn is_license_error_terminal(payload: &[u8]) -> bool {
+    // Payload layout after bMsgType:
+    //   flags(1) + wMsgSize(2) + dwErrorCode(4) + dwStateTransition(4) + blob
+    // dwStateTransition == 0x00000002 means ST_NO_TRANSITION (done)
+    // dwStateTransition == 0x00000004 means ST_TOTAL_ABORT (error, but we
+    //   still treat it as "licensing done" because xrdp uses TOTAL_ABORT with
+    //   STATUS_VALID_CLIENT to signal "no license needed").
+    if payload.len() < 12 {
+        return true; // too short to parse — assume terminal
+    }
+    let state_transition = u32::from_le_bytes([
+        payload[8],
+        payload[9],
+        payload[10],
+        payload[11],
+    ]);
+    // 0x01 = ST_PUSH_LICENSE  (not terminal — more packets coming)
+    state_transition != 0x00000001
+}
+
+/// Drive the licensing exchange and return `true` once the Demand Active PDU
+/// is received (or `false` on timeout / server close).
+///
+/// The function reads packets in a loop:
+///   - Licensing packets are handled / replied-to and the loop continues.
+///   - Any packet that contains a Demand Active PDU exits with `true`.
+///   - If 60 consecutive packets pass without a Demand Active, we give up.
+async fn wait_for_demand_active(
+    stream: &mut RdpStream,
+    buf: &mut Vec<u8>,
+    user_channel_id: u16,
+    debug: &RdpDebugStats,
+) -> anyhow::Result<bool> {
+    // Max read iterations: generous enough for a full Windows licensing round-
+    // trip (typically 4–6 packets) plus some slack for slow links.
+    const MAX_ITERS: usize = 60;
+    const READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+    for i in 0..MAX_ITERS {
+        let n = tokio::time::timeout(READ_TIMEOUT, stream.read(buf))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Timed out waiting for server response after Client Info PDU \
+                     (iteration {i}). Ensure NLA is disabled on the RDP server."
+                )
+            })??;
+
+        if n == 0 {
+            return Ok(false);
+        }
+
+        let packet = &buf[..n];
+
+        // ── Fast path: Demand Active arrives ────────────────────────────────
+        if contains_demand_active(packet) {
+            debug.log_connect(format!("licensing done: demand active received at iter {i}"));
+            return Ok(true);
+        }
+
+        // ── Licensing PDU? ───────────────────────────────────────────────────
+        if let Some((_sec_flags, lic_payload)) = extract_license_payload(packet) {
+            match license_msg_type(lic_payload) {
+                Some(LICENSE_REQUEST) => {
+                    debug.log_connect("licensing: <- LICENSE_REQUEST, sending new license request");
+                    let resp = build_client_new_license_request(user_channel_id);
+                    stream.write_all(&resp).await?;
+                }
+                Some(PLATFORM_CHALLENGE) => {
+                    debug.log_connect("licensing: <- PLATFORM_CHALLENGE, sending challenge response");
+                    let resp = build_client_platform_challenge_response(user_channel_id);
+                    stream.write_all(&resp).await?;
+                }
+                Some(NEW_LICENSE) | Some(UPGRADE_LICENSE) => {
+                    // Server granted a license — next packet should be Demand Active
+                    debug.log_connect("licensing: <- NEW/UPGRADE_LICENSE, licensing complete");
+                }
+                Some(LICENSE_ERROR_ALERT) => {
+                    // xrdp sends STATUS_VALID_CLIENT (0xFF03) here — means "no license needed"
+                    if is_license_error_terminal(lic_payload) {
+                        debug.log_connect("licensing: <- ERROR_ALERT (terminal), licensing complete");
+                    } else {
+                        debug.log_connect("licensing: <- ERROR_ALERT (non-terminal), continuing");
+                    }
+                }
+                Some(other) => {
+                    debug.log_connect(format!("licensing: <- unknown msg_type=0x{other:02X}, continuing"));
+                }
+                None => {
+                    debug.log_connect("licensing: empty payload, continuing");
+                }
+            }
+            // Loop back to read next packet regardless of license type
+            continue;
+        }
+
+        // ── Not a licensing PDU and not a Demand Active: could be an early
+        //    Deactivate-All or similar — just skip and keep waiting.
+        debug.log_connect(format!(
+            "licensing wait: non-license non-demand packet ({n} bytes) at iter {i}, skipping"
+        ));
+    }
+
+    Ok(false)
 }
 
 fn contains_demand_active(data: &[u8]) -> bool {
@@ -3808,6 +4103,114 @@ mod tests {
         let bitmap = server_share_control_pdu(0x0017, &[0xAA, 0x11, 0x00, 0xBB]);
         assert!(!is_demand_active_pdu(&bitmap));
         assert!(!contains_demand_active(&bitmap));
+    }
+
+    // ─── Licensing PDU helpers ────────────────────────────────────────────────
+
+    /// Build a minimal server licensing PDU (TPKT + MCS + SEC_LICENSE_PKT).
+    fn server_license_pdu(msg_type: u8, extra_payload: &[u8]) -> Vec<u8> {
+        // TS_LICENSE_PDU body: bMsgType(1) + flags(1) + wMsgSize(2) + data
+        let body_size = 4 + extra_payload.len();
+        let mut body = Vec::with_capacity(body_size);
+        body.push(msg_type);
+        body.push(0x00); // flags
+        body.extend_from_slice(&(body_size as u16).to_le_bytes()); // wMsgSize
+        body.extend_from_slice(extra_payload);
+
+        // Security header: SEC_LICENSE_PKT(0x0080) + flagsHi(0x0000)
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0x0080u16.to_le_bytes());
+        payload.extend_from_slice(&0x0000u16.to_le_bytes());
+        payload.extend_from_slice(&body);
+
+        // MCS SendDataIndication tag = 0x68
+        let mut mcs = Vec::new();
+        mcs.push(0x68); // SendDataIndication
+        mcs.extend_from_slice(&3u16.to_be_bytes()); // initiator
+        mcs.extend_from_slice(&1003u16.to_be_bytes()); // channelId
+        mcs.push(0x70); // dataPriority|segmentation
+        mcs.push(payload.len() as u8); // length (single byte, fits in test)
+        mcs.extend_from_slice(&payload);
+
+        let packet_len = 4 + 3 + mcs.len();
+        let mut packet = vec![0x03, 0x00];
+        packet.extend_from_slice(&(packet_len as u16).to_be_bytes());
+        packet.extend_from_slice(&[0x02, 0xF0, 0x80]);
+        packet.extend_from_slice(&mcs);
+        packet
+    }
+
+    #[test]
+    fn license_pdu_is_detected_as_sec_license_pkt() {
+        let pkt = server_license_pdu(LICENSE_ERROR_ALERT, &[0u8; 12]);
+        let result = extract_license_payload(&pkt);
+        assert!(result.is_some(), "should detect SEC_LICENSE_PKT");
+        let (sec_flags, body) = result.unwrap();
+        assert_eq!(sec_flags & SEC_LICENSE_PKT, SEC_LICENSE_PKT);
+        assert_eq!(license_msg_type(body), Some(LICENSE_ERROR_ALERT));
+    }
+
+    #[test]
+    fn license_error_alert_with_st_total_abort_is_terminal() {
+        // STATE_TRANSITION = 0x00000004 (ST_TOTAL_ABORT), STATUS_VALID_CLIENT
+        // xrdp sends this to indicate "no license required"
+        let mut extra = vec![0u8; 12];
+        // dwErrorCode at offset 4, dwStateTransition at offset 8
+        extra[8..12].copy_from_slice(&0x00000004u32.to_le_bytes());
+        let pkt = server_license_pdu(LICENSE_ERROR_ALERT, &extra);
+        let (_, body) = extract_license_payload(&pkt).unwrap();
+        // body = bMsgType(1)+flags(1)+wMsgSize(2)+extra
+        assert!(is_license_error_terminal(&body[4..]));
+    }
+
+    #[test]
+    fn license_error_alert_with_st_push_license_is_not_terminal() {
+        let mut extra = vec![0u8; 12];
+        extra[8..12].copy_from_slice(&0x00000001u32.to_le_bytes()); // ST_PUSH_LICENSE
+        let pkt = server_license_pdu(LICENSE_ERROR_ALERT, &extra);
+        let (_, body) = extract_license_payload(&pkt).unwrap();
+        assert!(!is_license_error_terminal(&body[4..]));
+    }
+
+    #[test]
+    fn demand_active_is_not_misidentified_as_license_pdu() {
+        let demand = server_share_control_pdu(0x0011, &[]);
+        assert!(extract_license_payload(&demand).is_none());
+    }
+
+    /// wait_for_demand_active should succeed when the server sends a licensing
+    /// ERROR_ALERT (xrdp no-license mode) followed by the Demand Active PDU.
+    #[tokio::test]
+    async fn wait_for_demand_active_handles_xrdp_license_then_demand() {
+        // Build: license error + demand active
+        let license_pkt = server_license_pdu(LICENSE_ERROR_ALERT, &{
+            let mut e = vec![0u8; 12];
+            e[8..12].copy_from_slice(&0x00000004u32.to_le_bytes()); // ST_TOTAL_ABORT
+            e
+        });
+        let demand_active = server_share_control_pdu(0x0011, &[]);
+        let combined = [license_pkt.as_slice(), demand_active.as_slice()].concat();
+
+        // Use a tokio loopback pair so both ends are async from the start
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let combined_clone = combined.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut sock, &combined_clone)
+                .await
+                .unwrap();
+            // socket drops here → client sees EOF
+        });
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut rdp_stream = RdpStream::Plain(client);
+        let mut buf = vec![0u8; 65536];
+        let debug = RdpDebugStats::default();
+
+        let result = wait_for_demand_active(&mut rdp_stream, &mut buf, 1007, &debug).await;
+        assert!(result.unwrap(), "should find demand active after license PDU");
     }
 
     #[test]
