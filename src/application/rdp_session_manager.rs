@@ -110,13 +110,13 @@ impl RdpSessionManager {
 
             let result = runtime.run(command_rx).await;
 
-            // Cleanup session
-            sessions.write().await.remove(&sid);
-
-            match result {
+            // Send status/error events BEFORE removing the session so that
+            // any in-flight requestFrame calls get a proper response instead
+            // of a SessionNotFound error.
+            match &result {
                 Ok(()) => {
                     let _ = status_tx.send(ConnectionStatusEvent {
-                        session_id: sid,
+                        session_id: sid.clone(),
                         status: ConnectionStatus::Disconnected,
                         message: Some("disconnected".to_owned()),
                     });
@@ -128,12 +128,18 @@ impl RdpSessionManager {
                         message: msg.clone(),
                     });
                     let _ = status_tx.send(ConnectionStatusEvent {
-                        session_id: sid,
+                        session_id: sid.clone(),
                         status: ConnectionStatus::Error,
                         message: Some(msg),
                     });
                 }
             }
+
+            // Cleanup session after events are emitted
+            sessions.write().await.remove(&sid);
+
+            // Result already handled above — nothing more to do
+            let _ = result;
         });
 
         Ok(info)
