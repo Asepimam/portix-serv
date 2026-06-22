@@ -13,7 +13,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(frb_expand)"] }
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
-flutter_rust_bridge = "=2.11.1"
+flutter_rust_bridge = "=2.12.0"
 once_cell = "1"
 russh = { version = "0.61.2", features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
